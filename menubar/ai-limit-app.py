@@ -42,8 +42,7 @@ _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _EN_RESET_PAD  = 8
-# 同步到开源版时改为 "https://github.com/zhuchenxi113/ai-limit"
-_PROJECT_URL   = "https://gitee.com/zhuchenxi113/ai-limit-private"
+_PROJECT_URL   = "https://github.com/zhuchenxi113/ai-limit"
 _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
 

@@ -28,8 +28,8 @@ OPTIONS = {
         "CFBundleName": "ai-limit",
         "CFBundleDisplayName": "ai-limit",
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit",
-        "CFBundleVersion": "0.3.1",
-        "CFBundleShortVersionString": "0.3.1",
+        "CFBundleVersion": "0.3.2",
+        "CFBundleShortVersionString": "0.3.2",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

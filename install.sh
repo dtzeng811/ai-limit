@@ -51,7 +51,7 @@ ok "下载完成"
 # ── 挂载 DMG ─────────────────────────────────────────────────────────────────
 info "挂载磁盘映像…"
 MOUNT_OUT=$(hdiutil attach "$DMG_PATH" -nobrowse -noverify -noautoopen 2>&1)
-MOUNT_POINT=$(printf '%s' "$MOUNT_OUT" | grep '/Volumes/' | awk '{print $NF}')
+MOUNT_POINT=$(printf '%s' "$MOUNT_OUT" | grep '/Volumes/' | awk -F'\t' '{print $NF}')
 [[ -n "$MOUNT_POINT" ]] || die "挂载失败：\n${MOUNT_OUT}"
 
 # ── 复制 App ─────────────────────────────────────────────────────────────────

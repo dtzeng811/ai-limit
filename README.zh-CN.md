@@ -51,9 +51,13 @@ bash make-dmg.sh
 
 ## 命令行
 
+输出语言根据系统语言自动切换，无需手动设置。
+
 ### 效果
 
-![CLI 截图](docs/screenshot-cli.png)
+![CLI 截图（英文）](docs/screenshot-cli-en.png)
+
+![CLI 截图（中文）](docs/screenshot-cli.png)
 
 ### 环境要求
 

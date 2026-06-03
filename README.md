@@ -51,9 +51,13 @@ bash make-dmg.sh
 
 ## CLI
 
+Output language is detected automatically from your system locale.
+
 ### Preview
 
-![CLI screenshot](docs/screenshot-cli.png)
+![CLI screenshot (English)](docs/screenshot-cli-en.png)
+
+![CLI screenshot (Chinese)](docs/screenshot-cli.png)
 
 ### Requirements
 

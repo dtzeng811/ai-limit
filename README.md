@@ -4,9 +4,11 @@ English | [中文说明](README.zh-CN.md)
 
 A lightweight tool to monitor real-time **Claude Code** and **Codex** usage limits, quota consumption, and token statistics — so you can adjust your AI usage before hitting rate limits. Available as a macOS menu bar app or a CLI.
 
+If you find it useful, a Star would be appreciated: [GitHub](https://github.com/zhuchenxi113/ai-limit) · [Gitee](https://gitee.com/zhuchenxi113/ai-limit)
+
 ## macOS Menu Bar App
 
-Lives in the menu bar, shows live quota at a glance — no terminal needed.
+Lives in the menu bar, shows live quota at a glance — no terminal needed. Because it displays text data directly in the menu bar, it takes up more space than a typical icon-only app; a menu bar manager like Bartender is recommended.
 
 ![Menu bar screenshot](docs/screenshot-menubar.png)
 
@@ -142,6 +144,11 @@ The browser path (1) reuses the same analytics endpoint that powers the chatgpt.
 ## Maintenance
 
 This is a personal tool maintained on a best-effort basis. Issues and PRs are welcome but not guaranteed to be addressed promptly. No long-term support is promised.
+
+## Other projects by the author
+
+- [CalcPro — Calculator](https://apps.apple.com/us/app/calcpro-calculator-waitsugar/id6759244291): An iOS calculator app, available on the App Store.
+- [观点会审 (Decide)](https://decide.waitsugar.com/): A web-based decision-making tool.
 
 ## License
 

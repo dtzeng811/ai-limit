@@ -4,9 +4,11 @@
 
 查看 Claude Code 和 CodeX 的实时剩余额度与 token 消耗情况。支持 macOS 菜单栏 App 和命令行两种使用方式。
 
+如果觉得有用，欢迎给个 Star 鼓励作者：[GitHub](https://github.com/zhuchenxi113/ai-limit) · [Gitee](https://gitee.com/zhuchenxi113/ai-limit)
+
 ## macOS 菜单栏 App
 
-常驻菜单栏，实时显示剩余额度，无需打开终端。
+常驻菜单栏，实时显示剩余额度，无需打开终端。由于直接在菜单栏显示文字数据，占用空间较大，建议配合 Bartender 等工具整理菜单栏。
 
 ![菜单栏截图](docs/screenshot-menubar.png)
 
@@ -142,6 +144,11 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 ## 维护说明
 
 个人工具，按自己的使用需求维护，不保证及时处理 issue 或 PR，也不承诺长期支持。
+
+## 作者其他项目
+
+- [CalcPro — 计算器](https://apps.apple.com/us/app/calcpro-calculator-waitsugar/id6759244291)：iOS 计算器 App，App Store 可下载。
+- [观点会审](https://decide.waitsugar.com/)：网页版决策辅助工具。
 
 ## License
 

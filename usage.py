@@ -27,7 +27,7 @@ CODEX_BASE = pathlib.Path.home() / ".codex" / "sessions"
 _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -162,7 +162,10 @@ def find_free_local_port() -> int:
 # ── Claude Web 额度 (--claude-web) ────────────────────────────────────────────
 
 class ClaudeWebError(Exception):
-    pass
+    """kind: 'generic' | 'cloudflare'（需人机验证）| 'auth'（登录失效）| 'timeout'"""
+    def __init__(self, message, kind="generic"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _claude_web_context(referer: str) -> tuple[str, dict]:
@@ -232,7 +235,26 @@ def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
-        raise ClaudeWebError(f"HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
+        raw = e.read()[:600].decode(errors="replace")
+        # Cf-Mitigated: challenge 是 Cloudflare 给拦截/挑战响应打的唯一标记，
+        # 不随页面语言或 HTML 改版变化，优先以此判别；body 匹配仅作兜底。
+        is_cf = bool(e.headers.get("cf-mitigated"))
+        if not is_cf:
+            low = raw.lower()
+            is_cf = any(m in low for m in (
+                "just a moment", "challenge-platform", "/cdn-cgi/", "请验证您是真人"))
+        if is_cf:
+            raise ClaudeWebError(t(
+                "claude.ai 触发了 Cloudflare 人机验证，请在浏览器打开 claude.ai 通过验证后重试",
+                "claude.ai is showing a Cloudflare human-verification challenge; "
+                "open claude.ai in your browser, pass it, then retry",
+            ), kind="cloudflare")
+        if e.code in (401, 403):
+            raise ClaudeWebError(t(
+                "claude.ai 登录态已失效，请在浏览器重新登录",
+                "claude.ai session expired, please re-login in your browser",
+            ), kind="auth")
+        raise ClaudeWebError(f"HTTP {e.code}: {raw[:300]}")
     except Exception as e:
         raise ClaudeWebError(str(e))
 

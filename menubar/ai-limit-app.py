@@ -200,9 +200,15 @@ def _fetch_claude(lang):
             "plan":     plan,
         }
     except ClaudeWebError as e:
-        msg = str(e)
-        if "JSON" in msg or "DOCTYPE" in msg or "html" in msg.lower():
-            msg = _tr(lang, "网络不可用或需重新登录 claude.ai", "Network error or re-login at claude.ai required")
+        kind = getattr(e, "kind", "generic")
+        if kind == "cloudflare":
+            msg = _tr(lang, "需在浏览器通过 claude.ai 人机验证", "Pass claude.ai human-check in browser")
+        elif kind == "auth":
+            msg = _tr(lang, "需在浏览器重新登录 claude.ai", "Re-login at claude.ai in browser")
+        else:
+            msg = str(e)
+            if "JSON" in msg or "DOCTYPE" in msg or "html" in msg.lower():
+                msg = _tr(lang, "网络不可用或需重新登录 claude.ai", "Network error or re-login at claude.ai required")
         return {"error": msg}
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}

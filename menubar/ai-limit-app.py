@@ -52,7 +52,7 @@ _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
 _CACHE_TTL    = 55
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
-_LANGS         = ("zh", "en")
+_LANGS         = ("zh", "en", "auto")
 _SERVICES      = ("claude", "codex")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
@@ -148,9 +148,9 @@ def _fmt_reset_iso(iso, lang="zh"):
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
-    # lang: None 表示用户从未在菜单里显式选过——交给 self._lang() 按系统语言实时判定；
-    # 一旦写入 "zh"/"en"，就是显式选择，永久优先于系统语言。
-    state = {"global": "5h", "lang": None, "services": list(_SERVICES)}
+    # lang: "auto"（默认）= 跟随系统，每次启动按 NSLocale 实时判定；
+    # "zh"/"en" = 用户在菜单里显式选过，永久优先于系统语言。
+    state = {"global": "5h", "lang": "auto", "services": list(_SERVICES)}
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -433,10 +433,11 @@ class AiLimitApp(rumps.App):
         self._build_menu()
 
     def _lang(self):
-        """当前生效语言：用户在菜单里显式选过则用该选择（持久化覆盖），
-        否则每次启动都按系统语言走——不把检测结果写回 state，
-        避免被其他偏好的保存操作连带固化成"伪用户选择"。"""
-        return self._state["lang"] or _SYSTEM_LANG
+        """当前生效语言：菜单里选了"中文"/"English"就用该选择（持久化覆盖），
+        选"跟随系统"（或旧状态文件没有该字段）则每次启动按 NSLocale 实时判定——
+        不把检测结果写回 state，避免被其他偏好的保存操作连带固化成"伪用户选择"。"""
+        choice = self._state["lang"]
+        return choice if choice in ("zh", "en") else _SYSTEM_LANG
 
     # ── 菜单构建 ──────────────────────────────────────────────────────────────
 
@@ -467,10 +468,12 @@ class AiLimitApp(rumps.App):
         self._mode_menu.add(self._mode_7d)
 
         # 语言子菜单
-        self._lang_zh = rumps.MenuItem("中文", callback=self._set_lang_zh)
-        self._lang_en = rumps.MenuItem("English", callback=self._set_lang_en)
+        self._lang_auto = rumps.MenuItem(_tr(lang, "跟随系统", "Follow System"), callback=self._set_lang_auto)
+        self._lang_zh   = rumps.MenuItem("中文", callback=self._set_lang_zh)
+        self._lang_en   = rumps.MenuItem("English", callback=self._set_lang_en)
         lang_label = "语言" if lang == "zh" else "Language"
         self._lang_menu = rumps.MenuItem(lang_label)
+        self._lang_menu.add(self._lang_auto)
         self._lang_menu.add(self._lang_zh)
         self._lang_menu.add(self._lang_en)
 
@@ -731,6 +734,15 @@ class AiLimitApp(rumps.App):
             f"Menu bar display ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
         )
 
+    def _set_lang_auto(self, _):
+        self._state["lang"] = "auto"
+        _save_state(self._state)
+        self._update_lang_checks()
+        self._update_mode_checks()
+        self._update_service_checks()
+        self._refresh_static_labels()
+        self._render()
+
     def _set_lang_zh(self, _):
         self._state["lang"] = "zh"
         _save_state(self._state)
@@ -774,13 +786,14 @@ class AiLimitApp(rumps.App):
         self._quit_item.title    = _tr(lang, "退出", "Quit")
 
     def _update_lang_checks(self):
+        choice = self._state["lang"]
         lang = self._lang()
-        self._lang_zh.title = ("✓ " if lang == "zh" else "  ") + "中文"
-        self._lang_en.title = ("✓ " if lang == "en" else "  ") + "English"
-        self._lang_menu.title = _tr(lang,
-            f"语言（{'中文' if lang == 'zh' else 'English'}）",
-            f"Language ({'中文' if lang == 'zh' else 'English'})",
-        )
+        self._lang_auto.title = ("✓ " if choice == "auto" else "  ") + _tr(lang, "跟随系统", "Follow System")
+        self._lang_zh.title   = ("✓ " if choice == "zh"   else "  ") + "中文"
+        self._lang_en.title   = ("✓ " if choice == "en"   else "  ") + "English"
+        sel_zh = {"zh": "中文", "en": "English"}.get(choice, "跟随系统")
+        sel_en = {"zh": "中文", "en": "English"}.get(choice, "Follow System")
+        self._lang_menu.title = _tr(lang, f"语言（{sel_zh}）", f"Language ({sel_en})")
 
     # ── 监控服务切换 ────────────────────────────────────────────────────────
 

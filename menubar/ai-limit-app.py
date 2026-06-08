@@ -29,6 +29,22 @@ from usage import (
     epoch_to_local,
 )
 
+
+def _detect_system_lang() -> str:
+    """GUI App 走 Cocoa 偏好语言（NSLocale），不依赖 POSIX LANG/locale——
+    py2app 打包后由 Launch Services 启动，POSIX locale 环境变量通常不反映
+    「系统设置 → 语言与地区」里用户的实际选择。"""
+    try:
+        langs = AppKit.NSLocale.preferredLanguages()
+        if langs and str(langs[0]).lower().startswith("zh"):
+            return "zh"
+    except Exception:
+        pass
+    return "en"
+
+
+_SYSTEM_LANG = _detect_system_lang()
+
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
 _STATE_PATH   = pathlib.Path.home() / ".ai-limit-menubar.json"
@@ -132,7 +148,9 @@ def _fmt_reset_iso(iso, lang="zh"):
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
-    state = {"global": "5h", "lang": "zh", "services": list(_SERVICES)}
+    # lang: None 表示用户从未在菜单里显式选过——交给 self._lang() 按系统语言实时判定；
+    # 一旦写入 "zh"/"en"，就是显式选择，永久优先于系统语言。
+    state = {"global": "5h", "lang": None, "services": list(_SERVICES)}
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -414,10 +432,16 @@ class AiLimitApp(rumps.App):
         self._pending_lock = threading.Lock()
         self._build_menu()
 
+    def _lang(self):
+        """当前生效语言：用户在菜单里显式选过则用该选择（持久化覆盖），
+        否则每次启动都按系统语言走——不把检测结果写回 state，
+        避免被其他偏好的保存操作连带固化成"伪用户选择"。"""
+        return self._state["lang"] or _SYSTEM_LANG
+
     # ── 菜单构建 ──────────────────────────────────────────────────────────────
 
     def _build_menu(self):
-        lang = self._state["lang"]
+        lang = self._lang()
 
         # Claude 区块（段头 + 详情都挂 no-op callback 避免 macOS 自动灰化）
         self._claude_header = _inert(rumps.MenuItem("Claude Code"))
@@ -486,7 +510,7 @@ class AiLimitApp(rumps.App):
                                             callback=lambda _: webbrowser.open(_PROJECT_URL))
         self._about_author = rumps.MenuItem(
             "作者：zhuchenxi" if lang == "zh" else "Author: zhuchenxi",
-            callback=lambda _: webbrowser.open(_AUTHOR_URL_ZH if self._state["lang"] == "zh" else _AUTHOR_URL_EN),
+            callback=lambda _: webbrowser.open(_AUTHOR_URL_ZH if self._lang() == "zh" else _AUTHOR_URL_EN),
         )
         self._about_desc   = _disable(rumps.MenuItem(
             "Claude Code / CodeX 额度监控" if lang == "zh" else "Claude Code / CodeX quota monitor"
@@ -604,7 +628,7 @@ class AiLimitApp(rumps.App):
 
     def _async_refresh(self):
         """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
-        lang = self._state["lang"]
+        lang = self._lang()
         services = self._state.get("services") or list(_SERVICES)
         claude = _fetch_claude(lang) if "claude" in services else None
         codex  = _fetch_codex(lang)  if "codex"  in services else None
@@ -612,7 +636,7 @@ class AiLimitApp(rumps.App):
             self._pending = (claude, codex)
 
     def _render(self):
-        lang     = self._state["lang"]
+        lang     = self._lang()
         mode     = self._state["global"]
         services = self._state.get("services") or list(_SERVICES)
         show_claude = "claude" in services
@@ -698,7 +722,7 @@ class AiLimitApp(rumps.App):
         self._render()
 
     def _update_mode_checks(self):
-        lang = self._state["lang"]
+        lang = self._lang()
         mode = self._state["global"]
         self._mode_5h.title = ("✓ " if mode == "5h" else "  ") + _tr(lang, "5 小时", "5 hours")
         self._mode_7d.title = ("✓ " if mode == "7d" else "  ") + _tr(lang, "7 天", "7 days")
@@ -728,7 +752,7 @@ class AiLimitApp(rumps.App):
 
     def _refresh_static_labels(self):
         """语言切换后，更新所有不依赖数据的菜单文字。"""
-        lang = self._state["lang"]
+        lang = self._lang()
         self._refresh_item.title = _tr(lang, "立即刷新", "Refresh now")
         self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
@@ -750,7 +774,7 @@ class AiLimitApp(rumps.App):
         self._quit_item.title    = _tr(lang, "退出", "Quit")
 
     def _update_lang_checks(self):
-        lang = self._state["lang"]
+        lang = self._lang()
         self._lang_zh.title = ("✓ " if lang == "zh" else "  ") + "中文"
         self._lang_en.title = ("✓ " if lang == "en" else "  ") + "English"
         self._lang_menu.title = _tr(lang,
@@ -789,13 +813,13 @@ class AiLimitApp(rumps.App):
         self._update_login_item_check()
 
     def _update_login_item_check(self):
-        lang = self._state["lang"]
+        lang = self._lang()
         enabled = _login_item_enabled()
         suffix = " ✓" if enabled else ""
         self._login_item.title = _tr(lang, "开机自启", "Launch at Login") + suffix
 
     def _update_service_checks(self):
-        lang = self._state["lang"]
+        lang = self._lang()
         svc = self._state.get("services") or list(_SERVICES)
         self._svc_claude.title = ("✓ " if "claude" in svc else "  ") + "Claude Code"
         self._svc_codex.title  = ("✓ " if "codex"  in svc else "  ") + "CodeX"

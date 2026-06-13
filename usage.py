@@ -161,6 +161,44 @@ def find_free_local_port() -> int:
 
 # ── Claude Web 额度 (--claude-web) ────────────────────────────────────────────
 
+_DIAG_LOG = pathlib.Path.home() / ".ai-limit-error.log"
+
+def _diag_log(tag: str, info: dict, _max_lines: int = 200) -> None:
+    """把出错现场写到 ~/.ai-limit-error.log，用于事后定位误判（如把瞬时 403
+    误报成"需人机验证/重新登录"）。只在异常路径调用，频率低；保留最近
+    _max_lines 条；任何写失败都静默吞掉，绝不影响主流程。"""
+    try:
+        line = json.dumps(
+            {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+             "tag": tag, **info},
+            ensure_ascii=False,
+        )
+        old = []
+        try:
+            old = _DIAG_LOG.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            pass
+        lines = (old + [line])[-_max_lines:]
+        _DIAG_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _cookie_summary(cookie_header: str) -> dict:
+    """从 Cookie 请求头解析出关键 cookie 是否存在（不记录值，避免泄露 session）。
+    用来区分'cookie 读取竞争读到残缺态'与'服务端真 403'。"""
+    try:
+        names = {p.split("=", 1)[0].strip() for p in cookie_header.split(";") if "=" in p}
+    except Exception:
+        names = set()
+    return {
+        "cookie_count": len(names),
+        "has_sessionKey": "sessionKey" in names,
+        "has_lastActiveOrg": "lastActiveOrg" in names,
+        "has_cf_clearance": "cf_clearance" in names,
+    }
+
+
 class ClaudeWebError(Exception):
     """kind: 'generic' | 'cloudflare'（需人机验证）| 'auth'（登录失效）| 'timeout'"""
     def __init__(self, message, kind="generic"):
@@ -243,6 +281,18 @@ def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
             low = raw.lower()
             is_cf = any(m in low for m in (
                 "just a moment", "challenge-platform", "/cdn-cgi/", "请验证您是真人"))
+        kind = "cloudflare" if is_cf else ("auth" if e.code in (401, 403) else "generic")
+        # 记录现场，事后区分根因：瞬时 403 / 真 Cloudflare 挑战 / cookie 残缺
+        _diag_log("claude_web_http_error", {
+            "path": path,
+            "code": e.code,
+            "decided_kind": kind,
+            "cf_mitigated": e.headers.get("cf-mitigated"),
+            "cf_ray": e.headers.get("cf-ray"),
+            "server": e.headers.get("server"),
+            "body_head": raw[:200],
+            **_cookie_summary(headers.get("Cookie", "")),
+        })
         if is_cf:
             raise ClaudeWebError(t(
                 "claude.ai 触发了 Cloudflare 人机验证，请在浏览器打开 claude.ai 通过验证后重试",

@@ -50,7 +50,8 @@ _SYSTEM_LANG = _detect_system_lang()
 _STATE_PATH   = pathlib.Path.home() / ".ai-limit-menubar.json"
 _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
 _CACHE_TTL    = 55
-_REFRESH_SEC  = 60
+_REFRESH_SEC  = 60               # 兜底默认（= 1 分钟）
+_REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en", "auto")
 _SERVICES      = ("claude", "codex")
@@ -150,7 +151,8 @@ def _fmt_reset_iso(iso, lang="zh"):
 def _load_state():
     # lang: "auto"（默认）= 跟随系统，每次启动按 NSLocale 实时判定；
     # "zh"/"en" = 用户在菜单里显式选过，永久优先于系统语言。
-    state = {"global": "5h", "lang": "auto", "services": list(_SERVICES)}
+    state = {"global": "5h", "lang": "auto", "services": list(_SERVICES),
+             "refresh_min": 1}
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -162,6 +164,8 @@ def _load_state():
                 svc = [s for s in raw["services"] if s in _SERVICES]
                 if svc:
                     state["services"] = svc
+            if raw.get("refresh_min") in _REFRESH_MINS:
+                state["refresh_min"] = raw["refresh_min"]
     except Exception:
         pass
     return state
@@ -430,7 +434,15 @@ class AiLimitApp(rumps.App):
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
+        self._last_refresh_str = "…"   # 折进刷新频率子菜单标题，无单独菜单行
         self._build_menu()
+        # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
+        # 不用 @rumps.timer 装饰器——那是静态绑定，改不了间隔。
+        self._auto_timer = rumps.Timer(self._auto_refresh, self._refresh_sec())
+        self._auto_timer.start()
+
+    def _refresh_sec(self):
+        return self._state.get("refresh_min", 1) * 60
 
     def _lang(self):
         """当前生效语言：菜单里选了"中文"/"English"就用该选择（持久化覆盖），
@@ -454,8 +466,14 @@ class AiLimitApp(rumps.App):
         self._codex_5h     = _inert(rumps.MenuItem("  5h  …"))
         self._codex_7d     = _inert(rumps.MenuItem("  7d  …"))
 
-        # 上次刷新（次要信息，刻意灰色）
-        self._last_refresh = _disable(rumps.MenuItem("…"))
+        # 刷新频率子菜单（1–5 分钟单选）。标题同时携带"上次刷新"时间，
+        # 二者合一行——NSMenu 每个 item 自占一行，无法两项共行。
+        self._rate_items = {}
+        self._rate_menu = rumps.MenuItem("")
+        for m in _REFRESH_MINS:
+            it = rumps.MenuItem("", callback=self._make_set_rate(m))
+            self._rate_items[m] = it
+            self._rate_menu.add(it)
 
         # 菜单栏显示子菜单
         self._mode_5h = rumps.MenuItem("5 小时" if lang == "zh" else "5 hours",
@@ -548,14 +566,14 @@ class AiLimitApp(rumps.App):
             self._codex_5h,
             self._codex_7d,
             None,
-            self._last_refresh,
+            self._rate_menu,
+            self._refresh_item,
             None,
             self._mode_menu,
             self._lang_menu,
             self._svc_menu,
             self._login_item,
             None,
-            self._refresh_item,
             self._codex_dash,
             self._claude_dash,
             None,
@@ -569,6 +587,7 @@ class AiLimitApp(rumps.App):
         self._update_mode_checks()
         self._update_lang_checks()
         self._update_service_checks()
+        self._update_rate_checks()
 
     # ── 数据更新 ──────────────────────────────────────────────────────────────
     #
@@ -588,9 +607,8 @@ class AiLimitApp(rumps.App):
         self._kick_background_fetch()
         sender.stop()
 
-    @rumps.timer(_REFRESH_SEC)
     def _auto_refresh(self, _):
-        """每 60s 后台拉一次。"""
+        """按用户选择的频率后台拉一次（由 self._auto_timer 驱动，间隔可调）。"""
         self._kick_background_fetch()
 
     @rumps.timer(0.4)
@@ -706,9 +724,9 @@ class AiLimitApp(rumps.App):
                 self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)
                 self._codex_7d.title = _detail_text("7d", codex["7d_left"], x7_reset, lang)
 
-        # 刷新时间
-        now = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
-        self._last_refresh.title = _tr(lang, f"上次刷新: {now}", f"Last refresh: {now}")
+        # 刷新时间：折进刷新频率子菜单标题（见 _update_rate_checks）
+        self._last_refresh_str = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
+        self._update_rate_checks()
 
     # ── 模式 / 语言切换 ──────────────────────────────────────────────────────
 
@@ -733,6 +751,32 @@ class AiLimitApp(rumps.App):
             f"菜单栏显示（{_tr(lang, '5 小时', '5 hours') if mode == '5h' else _tr(lang, '7 天', '7 days')}）",
             f"Menu bar display ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
         )
+
+    # ── 刷新频率 ────────────────────────────────────────────────────────────
+    def _make_set_rate(self, minutes):
+        return lambda _: self._set_refresh_rate(minutes)
+
+    def _set_refresh_rate(self, minutes):
+        if minutes not in _REFRESH_MINS or minutes == self._state.get("refresh_min"):
+            self._update_rate_checks()  # 重画勾选，即使没变也保持一致
+            return
+        self._state["refresh_min"] = minutes
+        _save_state(self._state)
+        # 重建定时器间隔：stop → 改 interval → start（rumps 在 start 时才读取 interval）
+        self._auto_timer.stop()
+        self._auto_timer.interval = self._refresh_sec()
+        self._auto_timer.start()
+        self._update_rate_checks()
+
+    def _update_rate_checks(self):
+        lang = self._lang()
+        cur = self._state.get("refresh_min", 1)
+        for m, it in self._rate_items.items():
+            it.title = ("✓ " if m == cur else "  ") + _tr(lang, f"{m} 分钟", f"{m} min")
+        ts = self._last_refresh_str
+        self._rate_menu.title = _tr(lang,
+            f"刷新频率（{cur} 分钟）   上次: {ts}",
+            f"Refresh interval ({cur} min)   last: {ts}")
 
     def _set_lang_auto(self, _):
         self._state["lang"] = "auto"
@@ -782,6 +826,7 @@ class AiLimitApp(rumps.App):
             "Source: local logs + official web endpoints",
         )
         self._update_login_item_check()
+        self._update_rate_checks()
         self._star_item.title    = _tr(lang, "⭐ 给个 Star，鼓励作者", "⭐ Star on GitHub — support the author")
         self._quit_item.title    = _tr(lang, "退出", "Quit")
 

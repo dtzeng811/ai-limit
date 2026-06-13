@@ -151,6 +151,7 @@ The browser path (1) reuses the same analytics endpoint that powers the chatgpt.
 
 - **macOS only**: browser cookie reading relies on the system Keychain to decrypt Chrome cookies
 - **Unofficial API**: Claude quota is fetched from an internal claude.ai endpoint, not an official API — it may break with future updates
+- **Occasional ⚠️ (Cloudflare challenge)**: claude.ai / chatgpt.com may temporarily serve a Cloudflare bot-challenge to non-browser requests (based on TLS fingerprint — even a valid cookie can be blocked), surfaced as a ⚠️. It usually clears on its own. This affects any non-browser tool accessing these sites — the official Claude Code / Codex CLIs hit the same thing — so it is not a defect of ai-limit and generally needs no action
 - `<synthetic>` model entries are error placeholders written by Claude Code on API failures; they are excluded from all statistics
 - Per-model output share is only available for Claude Code; Codex does not expose per-model breakdown
 

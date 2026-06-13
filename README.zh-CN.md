@@ -151,6 +151,7 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 - 浏览器 Cookie 读取仅支持 macOS（依赖系统 Keychain 解密 Chrome Cookie）
 - Claude 额度使用的是 claude.ai 内部接口，**非官方 API**，可能随版本变化失效
+- **偶发的 ⚠️ 多为 Cloudflare 临时拦截**：claude.ai / chatgpt.com 会对非浏览器请求基于 TLS 指纹做人机校验（带有效 cookie 也可能被拦），表现为 ⚠️，**多数会自行恢复**。这是所有非浏览器访问官网工具的共性问题（官方 Claude Code / Codex CLI 自身也会遇到），非本工具缺陷，通常无需处理
 - `<synthetic>` 模型记录是 Claude Code 遇到 API 错误时写入的占位，不计入统计
 - 各模型输出占比仅 Claude Code 提供；CodeX 不区分模型，无此数据
 

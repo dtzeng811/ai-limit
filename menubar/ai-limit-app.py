@@ -224,7 +224,7 @@ def _fetch_claude(lang):
     except ClaudeWebError as e:
         kind = getattr(e, "kind", "generic")
         if kind == "cloudflare":
-            msg = _tr(lang, "请求被拦截，点下方用量页刷新", "Blocked, open Claude usage below")
+            msg = _tr(lang, "被拦截，打开用量页勿关", "Blocked, open Claude usage, keep open")
         elif kind == "auth":
             msg = _tr(lang, "需在浏览器重新登录 claude.ai", "Re-login at claude.ai in browser")
         else:

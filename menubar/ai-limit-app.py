@@ -62,6 +62,13 @@ _EN_RESET_PAD  = 8
 _PROJECT_URL   = "https://github.com/zhuchenxi113/ai-limit"
 _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
+_RELEASES_API_URL  = "https://api.github.com/repos/zhuchenxi113/ai-limit/releases/latest"
+_RELEASES_PAGE_URL = _PROJECT_URL + "/releases"
+# Gitee 国内可直连，作为 GitHub 连不上时（常见于未配代理的用户）的兜底。
+# 注意：Gitee 官方 /releases/latest 接口实测有 bug，返回的不是真正最新版
+# （曾返回 v0.3.10 而实际最新是 v0.3.11）；改用列表按创建时间倒序取第一条才准确。
+_GITEE_RELEASES_API_URL  = "https://gitee.com/api/v5/repos/zhuchenxi113/ai-limit/releases?per_page=1&direction=desc"
+_GITEE_RELEASES_PAGE_URL = "https://gitee.com/zhuchenxi113/ai-limit/releases"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
 _LAUNCH_AGENT_PLIST = pathlib.Path.home() / "Library/LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
 _APP_EXECUTABLE     = pathlib.Path("/Applications/ai-limit.app/Contents/MacOS/ai-limit")
@@ -102,6 +109,49 @@ def _set_login_item(enabled: bool):
 
 def _tr(lang, zh, en):
     return en if lang == "en" else zh
+
+def _version_tuple(v: str):
+    return tuple(int(p) for p in v.lstrip("v").split("."))
+
+def _show_alert(title, message, ok, cancel=None) -> bool:
+    """rumps.alert() 包的是 AppKit 已废弃的 NSAlert 便捷构造器
+    （alertWithMessageText_defaultButton_alternateButton_otherButton_informativeTextWithFormat_），
+    在当前 macOS 版本下静默不弹窗、直接返回——实测确认（见 lessons）。
+    这里改用现代 NSAlert API（alloc/init + setMessageText_ + addButtonWithTitle_）自己拼，可正常显示。
+    返回是否点了第一个按钮（ok）。"""
+    alert = AppKit.NSAlert.alloc().init()
+    alert.setMessageText_(title)
+    alert.setInformativeText_(message)
+    alert.addButtonWithTitle_(ok)
+    if cancel:
+        alert.addButtonWithTitle_(cancel)
+    return alert.runModal() == AppKit.NSAlertFirstButtonReturn
+
+def _fetch_latest_release_info(timeout=6) -> dict:
+    """后台线程调用：查最新 Release tag。优先 GitHub；连不上（常见于未配代理
+    的用户，GitHub 在国内常被墙）时退到 Gitee（国内可直连）。不抛异常，
+    两边都失败才返回 {"error": True}。"""
+    import urllib.request
+
+    def _get_json(url):
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "ai-limit-menubar"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+
+    try:
+        data = _get_json(_RELEASES_API_URL)
+        return {"latest": data["tag_name"].lstrip("v"), "source": "github"}
+    except Exception:
+        pass
+
+    try:
+        data = _get_json(_GITEE_RELEASES_API_URL)
+        return {"latest": data[0]["tag_name"].lstrip("v"), "source": "gitee"}
+    except Exception:
+        return {"error": True}
 
 def _native_bar(pct, width=4):
     filled = round(max(0, min(100, pct)) / 100 * width)
@@ -434,6 +484,10 @@ class AiLimitApp(rumps.App):
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
+        # 检查更新：同样模式，后台线程查完放这里，_apply_pending 接力弹窗
+        self._update_checking = False
+        self._update_pending = None
+        self._update_lock = threading.Lock()
         self._last_refresh_str = "…"   # 折进刷新频率子菜单标题，无单独菜单行
         self._build_menu()
         # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
@@ -539,10 +593,13 @@ class AiLimitApp(rumps.App):
         self._about_src    = _disable(rumps.MenuItem(
             "数据来源：本地日志 + 官方网页接口" if lang == "zh" else "Source: local logs + official web endpoints"
         ))
+        self._check_update_item = rumps.MenuItem(
+            "检查更新" if lang == "zh" else "Check for Updates",
+            callback=self._check_for_updates,
+        )
         self._about_menu.add(self._about_ver)
         self._about_menu.add(self._about_author)
-        self._about_menu.add(self._about_desc)
-        self._about_menu.add(self._about_src)
+        self._about_menu.add(self._check_update_item)
 
         # Star on GitHub（放在关于子菜单里，_about_menu 之后才 add）
         self._star_item = rumps.MenuItem(
@@ -550,6 +607,8 @@ class AiLimitApp(rumps.App):
             callback=lambda _: webbrowser.open(_PROJECT_URL),
         )
         self._about_menu.add(self._star_item)
+        self._about_menu.add(self._about_desc)
+        self._about_menu.add(self._about_src)
 
         # 退出
         self._quit_item = rumps.MenuItem(
@@ -622,15 +681,22 @@ class AiLimitApp(rumps.App):
         with self._pending_lock:
             pending = self._pending
             self._pending = None
-        if pending is None:
-            return
-        claude, codex = pending
-        if claude is not None:
-            self._claude = claude
-        if codex is not None:
-            self._codex = codex
-        _save_cache(self._claude, self._codex)
-        self._render()
+        if pending is not None:
+            claude, codex = pending
+            if claude is not None:
+                self._claude = claude
+            if codex is not None:
+                self._codex = codex
+            _save_cache(self._claude, self._codex)
+            self._render()
+
+        with self._update_lock:
+            update_result = self._update_pending
+            self._update_pending = None
+        if update_result is not None:
+            self._update_checking = False
+            self._check_update_item.title = _tr(self._lang(), "检查更新", "Check for Updates")
+            self._show_update_result(update_result)
 
     def _refresh_from_cache(self):
         """主线程瞬时操作：读短缓存重画，不碰网络。"""
@@ -825,6 +891,8 @@ class AiLimitApp(rumps.App):
             "数据来源：本地日志 + 官方网页接口",
             "Source: local logs + official web endpoints",
         )
+        if not self._update_checking:
+            self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
         self._update_login_item_check()
         self._update_rate_checks()
         self._star_item.title    = _tr(lang, "⭐ 给个 Star，鼓励作者", "⭐ Star on GitHub — support the author")
@@ -895,6 +963,57 @@ class AiLimitApp(rumps.App):
             pass
         # 后台拉，不卡 UI；新数据 ≤几秒内通过 _apply_pending 落到菜单上
         self._kick_background_fetch()
+
+    # ── 检查更新 ──────────────────────────────────────────────────────────────
+
+    def _check_for_updates(self, _):
+        if self._update_checking:
+            return
+        self._update_checking = True
+        self._check_update_item.title = _tr(self._lang(), "检查更新…", "Checking for updates…")
+        threading.Thread(target=self._async_check_update, daemon=True).start()
+
+    def _async_check_update(self):
+        """后台线程：查 GitHub 最新 Release。不能调任何 rumps/AppKit UI。"""
+        result = _fetch_latest_release_info()
+        with self._update_lock:
+            self._update_pending = result
+
+    def _show_update_result(self, result):
+        lang = self._lang()
+        if result.get("error"):
+            _show_alert(
+                _tr(lang, "检查更新失败", "Update Check Failed"),
+                _tr(lang,
+                    "无法连接 GitHub，请检查网络后重试。",
+                    "Could not reach GitHub. Check your network and try again.",
+                ),
+                ok=_tr(lang, "好", "OK"),
+            )
+            return
+        latest = result["latest"]
+        if _version_tuple(latest) <= _version_tuple(__version__):
+            _show_alert(
+                _tr(lang, "已是最新版本", "You're Up to Date"),
+                _tr(lang,
+                    f"当前版本 {__version__} 已是最新。",
+                    f"Current version {__version__} is the latest.",
+                ),
+                ok=_tr(lang, "好", "OK"),
+            )
+            return
+        opened = _show_alert(
+            _tr(lang, "发现新版本", "Update Available"),
+            _tr(lang,
+                f"最新版本 {latest}，当前版本 {__version__}。是否打开下载页？",
+                f"Latest version {latest}, current version {__version__}. Open the download page?",
+            ),
+            ok=_tr(lang, "打开下载页", "Open Download Page"),
+            cancel=_tr(lang, "取消", "Cancel"),
+        )
+        if opened:
+            page_url = _GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee" else _RELEASES_PAGE_URL
+            webbrowser.open(page_url)
 
 
 if __name__ == "__main__":

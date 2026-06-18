@@ -2,6 +2,8 @@
 
 English | [中文说明](README.zh-CN.md)
 
+Official downloads: https://github.com/zhuchenxi113/ai-limit/releases
+
 A lightweight tool to monitor real-time **Claude Code** and **Codex** usage limits, quota consumption, and token statistics — so you can adjust your AI usage before hitting rate limits. Available as a macOS menu bar app or a CLI.
 
 If you find it useful, a Star would be appreciated: [GitHub](https://github.com/zhuchenxi113/ai-limit) · [Gitee](https://gitee.com/zhuchenxi113/ai-limit)

@@ -111,7 +111,14 @@ def _tr(lang, zh, en):
     return en if lang == "en" else zh
 
 def _version_tuple(v: str):
-    return tuple(int(p) for p in v.lstrip("v").split("."))
+    # 容忍预发布后缀（如 0.3.13-dev / 0.3.13-rc1）：每段只取前导数字，无数字记 0，
+    # 避免 int("13-dev") 抛 ValueError 导致「检查更新」静默不弹窗。
+    import re
+    out = []
+    for p in v.lstrip("v").split("."):
+        m = re.match(r"\d+", p)
+        out.append(int(m.group()) if m else 0)
+    return tuple(out)
 
 def _show_alert(title, message, ok, cancel=None) -> bool:
     """rumps.alert() 包的是 AppKit 已废弃的 NSAlert 便捷构造器

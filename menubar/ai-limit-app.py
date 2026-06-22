@@ -567,7 +567,7 @@ class AiLimitApp(rumps.App):
                                        callback=self._set_mode_5h)
         self._mode_7d = rumps.MenuItem("7 天" if lang == "zh" else "7 days",
                                        callback=self._set_mode_7d)
-        mode_label = "菜单栏显示" if lang == "zh" else "Menu bar display"
+        mode_label = "菜单栏显示周期" if lang == "zh" else "Menu bar period"
         self._mode_menu = rumps.MenuItem(mode_label)
         self._mode_menu.add(self._mode_5h)
         self._mode_menu.add(self._mode_7d)
@@ -870,8 +870,8 @@ class AiLimitApp(rumps.App):
         self._mode_5h.title = ("✓ " if mode == "5h" else "  ") + _tr(lang, "5 小时", "5 hours")
         self._mode_7d.title = ("✓ " if mode == "7d" else "  ") + _tr(lang, "7 天", "7 days")
         self._mode_menu.title = _tr(lang,
-            f"菜单栏显示（{_tr(lang, '5 小时', '5 hours') if mode == '5h' else _tr(lang, '7 天', '7 days')}）",
-            f"Menu bar display ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
+            f"菜单栏显示周期（{_tr(lang, '5 小时', '5 hours') if mode == '5h' else _tr(lang, '7 天', '7 days')}）",
+            f"Menu bar period ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
         )
 
     # ── 刷新频率 ────────────────────────────────────────────────────────────

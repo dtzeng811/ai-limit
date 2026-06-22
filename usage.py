@@ -9,6 +9,7 @@ usage.py — 查看 Claude Code + CodeX 本周 token 消耗与额度状态
 """
 import argparse
 import base64
+import functools
 import datetime
 import locale as _locale
 import os
@@ -49,6 +50,7 @@ def _bc(r: float) -> str:
     return _OK if r >= WARN_THRESHOLD else (_WRN if r >= CRIT_THRESHOLD else _CRT)
 
 
+@functools.lru_cache(maxsize=1)
 def _chrome_ua() -> str:
     ver = "124.0.0.0"
     candidates = (
@@ -639,16 +641,13 @@ def _load_chatgpt_cookies():
     ))
 
 
-_CHATGPT_UA = _chrome_ua()
-
-
 def _chatgpt_headers(cookie_header: str, *, referer: str = "https://chatgpt.com/codex/cloud/settings/analytics", bearer: str = None) -> dict:
     # 包含 Sec-Fetch-* / Accept-Language / Referer，避免 Cloudflare 反爬 403
     h = {
         "Cookie": cookie_header,
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": _CHATGPT_UA,
+        "User-Agent": _chrome_ua(),
         "Referer": referer,
         "Origin": "https://chatgpt.com",
         "Sec-Fetch-Dest": "empty",

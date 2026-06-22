@@ -53,6 +53,7 @@ _CACHE_TTL    = 55
 _REFRESH_SEC  = 60               # 兜底默认（= 1 分钟）
 _REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
 _DISPLAY_MODES = ("5h", "7d")
+_BAR_STYLES    = ("both", "number", "battery")  # 菜单栏样式：数字+电池 / 仅数字 / 仅电池
 _LANGS         = ("zh", "en", "auto")
 _SERVICES      = ("claude", "codex")
 _MENU_MIN_WIDTH = 290
@@ -208,7 +209,10 @@ def _fmt_reset_iso(iso, lang="zh"):
 def _load_state():
     # lang: "auto"（默认）= 跟随系统，每次启动按 NSLocale 实时判定；
     # "zh"/"en" = 用户在菜单里显式选过，永久优先于系统语言。
-    state = {"global": "5h", "lang": "auto", "services": list(_SERVICES),
+    state = {"global": "5h", "lang": "auto",
+             "bar_services": list(_SERVICES),    # 菜单栏图标显示哪些（不允许全空）
+             "panel_services": list(_SERVICES),  # 详情面板显示哪些（允许全空）
+             "bar_style": "both",                # 菜单栏样式：both/number/battery
              "refresh_min": 1}
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
@@ -217,10 +221,24 @@ def _load_state():
                 state["global"] = raw["global"]
             if raw.get("lang") in _LANGS:
                 state["lang"] = raw["lang"]
+            # 迁移：旧版本只有单一 services 字段，同时充当菜单栏与面板
+            legacy = None
             if isinstance(raw.get("services"), list):
-                svc = [s for s in raw["services"] if s in _SERVICES]
-                if svc:
-                    state["services"] = svc
+                legacy = [s for s in raw["services"] if s in _SERVICES]
+            # bar_services 不允许全空：空则忽略，回退到旧 services 或默认
+            if isinstance(raw.get("bar_services"), list):
+                f = [s for s in raw["bar_services"] if s in _SERVICES]
+                if f:
+                    state["bar_services"] = f
+            elif legacy:
+                state["bar_services"] = legacy
+            # panel_services 允许全空（用户可只看菜单栏）
+            if isinstance(raw.get("panel_services"), list):
+                state["panel_services"] = [s for s in raw["panel_services"] if s in _SERVICES]
+            elif legacy is not None:
+                state["panel_services"] = legacy
+            if raw.get("bar_style") in _BAR_STYLES:
+                state["bar_style"] = raw["bar_style"]
             if raw.get("refresh_min") in _REFRESH_MINS:
                 state["refresh_min"] = raw["refresh_min"]
     except Exception:
@@ -416,7 +434,7 @@ def _battery_attachment(pct, font):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
 
 
-def _render_attributed_title(items):
+def _render_attributed_title(items, style="both"):
     """构建状态栏 attributed title：文字交给 NSStatusBarButton 原生渲染（拿到
     系统 vibrancy 和亮暗自适应），电池作为内联 template image 附件。
 
@@ -438,24 +456,32 @@ def _render_attributed_title(items):
         if err:
             append_text(f"{prefix}{label} ⚠️")
             continue
-        append_text(f"{prefix}{label} {pct}% ")
-        bat_attach = _battery_attachment(pct, font)
-        if bat_attach is not None:
-            mas.appendAttributedString_(bat_attach)
+        if style == "number":
+            append_text(f"{prefix}{label} {pct}%")
+        elif style == "battery":
+            append_text(f"{prefix}{label} ")
+            bat_attach = _battery_attachment(pct, font)
+            if bat_attach is not None:
+                mas.appendAttributedString_(bat_attach)
+        else:  # both：数字 + 电池
+            append_text(f"{prefix}{label} {pct}% ")
+            bat_attach = _battery_attachment(pct, font)
+            if bat_attach is not None:
+                mas.appendAttributedString_(bat_attach)
 
     if mas.length() == 0:
         append_text("ai-limit ⚠️")
     return mas
 
 
-def _set_bar_with_batteries(app, items):
+def _set_bar_with_batteries(app, items, style="both"):
     """把 attributed title（文字 + 电池附件）安到状态栏按钮上。"""
     btn = _status_button(app)
     if btn is None:
         raise RuntimeError("no status button")
     btn.setImage_(None)
     btn.setTitle_("")
-    btn.setAttributedTitle_(_render_attributed_title(items))
+    btn.setAttributedTitle_(_render_attributed_title(items, style))
 
 def _noop(_):
     """无副作用 callback，仅用于让 macOS 把无动作菜单项也按常规文字色渲染。
@@ -556,13 +582,26 @@ class AiLimitApp(rumps.App):
         self._lang_menu.add(self._lang_zh)
         self._lang_menu.add(self._lang_en)
 
-        # 监控服务子菜单
-        self._svc_claude = rumps.MenuItem("Claude Code", callback=self._toggle_claude)
-        self._svc_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_codex)
-        svc_label = "监控服务" if lang == "zh" else "Services"
-        self._svc_menu = rumps.MenuItem(svc_label)
-        self._svc_menu.add(self._svc_claude)
-        self._svc_menu.add(self._svc_codex)
+        # 菜单栏图标子菜单：显示哪些服务 + 样式（数字+电池 / 仅数字 / 仅电池）
+        self._bar_claude = rumps.MenuItem("Claude Code", callback=self._toggle_bar_claude)
+        self._bar_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_bar_codex)
+        self._bar_style_both = rumps.MenuItem("", callback=self._make_set_bar_style("both"))
+        self._bar_style_num  = rumps.MenuItem("", callback=self._make_set_bar_style("number"))
+        self._bar_style_bat  = rumps.MenuItem("", callback=self._make_set_bar_style("battery"))
+        self._bar_menu = rumps.MenuItem("")
+        self._bar_menu.add(self._bar_claude)
+        self._bar_menu.add(self._bar_codex)
+        self._bar_menu.add(None)
+        self._bar_menu.add(self._bar_style_both)
+        self._bar_menu.add(self._bar_style_num)
+        self._bar_menu.add(self._bar_style_bat)
+
+        # 详情面板子菜单：显示哪些服务（允许全空，只看菜单栏）
+        self._panel_claude = rumps.MenuItem("Claude Code", callback=self._toggle_panel_claude)
+        self._panel_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_panel_codex)
+        self._panel_menu = rumps.MenuItem("")
+        self._panel_menu.add(self._panel_claude)
+        self._panel_menu.add(self._panel_codex)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -636,8 +675,9 @@ class AiLimitApp(rumps.App):
             self._refresh_item,
             None,
             self._mode_menu,
+            self._bar_menu,
+            self._panel_menu,
             self._lang_menu,
-            self._svc_menu,
             self._login_item,
             None,
             self._codex_dash,
@@ -652,7 +692,8 @@ class AiLimitApp(rumps.App):
         self.menu._menu.setMinimumWidth_(_MENU_MIN_WIDTH)
         self._update_mode_checks()
         self._update_lang_checks()
-        self._update_service_checks()
+        self._update_bar_checks()
+        self._update_panel_checks()
         self._update_rate_checks()
 
     # ── 数据更新 ──────────────────────────────────────────────────────────────
@@ -723,44 +764,52 @@ class AiLimitApp(rumps.App):
     def _async_refresh(self):
         """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
         lang = self._lang()
-        services = self._state.get("services") or list(_SERVICES)
-        claude = _fetch_claude(lang) if "claude" in services else None
-        codex  = _fetch_codex(lang)  if "codex"  in services else None
+        need = set(self._state.get("bar_services") or []) | set(self._state.get("panel_services") or [])
+        claude = _fetch_claude(lang) if "claude" in need else None
+        codex  = _fetch_codex(lang)  if "codex"  in need else None
         with self._pending_lock:
             self._pending = (claude, codex)
 
     def _render(self):
         lang     = self._lang()
         mode     = self._state["global"]
-        services = self._state.get("services") or list(_SERVICES)
-        show_claude = "claude" in services
-        show_codex  = "codex"  in services
+        bar_svc   = self._state.get("bar_services") or list(_SERVICES)
+        panel_svc = self._state.get("panel_services") or []
+        style     = self._state.get("bar_style", "both")
+        show_claude = "claude" in panel_svc   # 面板维度（下方区块沿用此变量）
+        show_codex  = "codex"  in panel_svc
         claude = self._claude or {}
         codex  = self._codex  or {}
 
         # 菜单栏标题：[Claude 68% ⌬]  [CodeX 99% ⌬]
         # 电池是原生 SF Symbol，Apple 亲手画的 iPhone 风格，向量永不糊
         bar_items = []
-        if show_claude:
+        if "claude" in bar_svc:
             if "error" in claude:
                 bar_items.append(("Claude", 0, True))
             elif claude:
                 pct = claude["5h_left"] if mode == "5h" else claude["7d_left"]
                 bar_items.append(("Claude", pct, False))
-        if show_codex:
+        if "codex" in bar_svc:
             if "error" in codex:
                 bar_items.append(("CodeX", 0, True))
             elif codex:
                 pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
                 bar_items.append(("CodeX", pct, False))
         try:
-            _set_bar_with_batteries(self, bar_items)
+            _set_bar_with_batteries(self, bar_items, style)
         except Exception:
             # SF Symbol 不可用时（很老的 macOS）回退到 ▰▱ 文字版
-            parts = [
-                f"{lbl} ⚠️" if err else f"{lbl} {pct}% {_native_bar(pct)}"
-                for lbl, pct, err in bar_items
-            ]
+            parts = []
+            for lbl, pct, err in bar_items:
+                if err:
+                    parts.append(f"{lbl} ⚠️")
+                elif style == "number":
+                    parts.append(f"{lbl} {pct}%")
+                elif style == "battery":
+                    parts.append(f"{lbl} {_native_bar(pct)}")
+                else:
+                    parts.append(f"{lbl} {pct}% {_native_bar(pct)}")
             _set_bar_title(self, "  ".join(parts) if parts else "ai-limit ⚠️")
 
         # Claude 区块 —— 服务被关时整段隐藏
@@ -856,7 +905,8 @@ class AiLimitApp(rumps.App):
         _save_state(self._state)
         self._update_lang_checks()
         self._update_mode_checks()
-        self._update_service_checks()
+        self._update_bar_checks()
+        self._update_panel_checks()
         self._refresh_static_labels()
         self._render()
 
@@ -866,7 +916,8 @@ class AiLimitApp(rumps.App):
         self._update_lang_checks()
         # 重画所有 i18n 文本（详情行 / 段头 / "上次刷新" 等）
         self._update_mode_checks()
-        self._update_service_checks()
+        self._update_bar_checks()
+        self._update_panel_checks()
         self._refresh_static_labels()
         self._render()
 
@@ -875,7 +926,8 @@ class AiLimitApp(rumps.App):
         _save_state(self._state)
         self._update_lang_checks()
         self._update_mode_checks()
-        self._update_service_checks()
+        self._update_bar_checks()
+        self._update_panel_checks()
         self._refresh_static_labels()
         self._render()
 
@@ -915,31 +967,58 @@ class AiLimitApp(rumps.App):
         sel_en = {"zh": "中文", "en": "English"}.get(choice, "Follow System")
         self._lang_menu.title = _tr(lang, f"语言（{sel_zh}）", f"Language ({sel_en})")
 
-    # ── 监控服务切换 ────────────────────────────────────────────────────────
+    # ── 菜单栏图标 / 详情面板 切换 ──────────────────────────────────────────
 
-    def _toggle_claude(self, _):
-        self._toggle_service("claude")
+    def _toggle_bar_claude(self, _):
+        self._toggle_bar("claude")
 
-    def _toggle_codex(self, _):
-        self._toggle_service("codex")
+    def _toggle_bar_codex(self, _):
+        self._toggle_bar("codex")
 
-    def _toggle_service(self, service):
-        svc = list(self._state.get("services") or list(_SERVICES))
+    def _toggle_bar(self, service):
+        svc = list(self._state.get("bar_services") or list(_SERVICES))
         if service in svc:
             svc.remove(service)
         else:
             svc.append(service)
         if not svc:
-            # 不允许两个都关掉，回退保留刚才被关的
+            # 菜单栏不允许全空（否则只剩空白点击区，找不到入口），回退保留
             svc = [service]
-        self._state["services"] = svc
+        self._state["bar_services"] = svc
         _save_state(self._state)
-        self._update_service_checks()
-        # 立即用现有数据重画（隐藏/显示对应区块），不卡 UI；
-        # 新启用的服务若有 ≤55s 的缓存就用，否则等下面后台拉
+        self._update_bar_checks()
         self._render()
-        # 后台异步刷新（如果新启用的服务无缓存，几秒后自动出现）
         self._kick_background_fetch()
+
+    def _toggle_panel_claude(self, _):
+        self._toggle_panel("claude")
+
+    def _toggle_panel_codex(self, _):
+        self._toggle_panel("codex")
+
+    def _toggle_panel(self, service):
+        svc = list(self._state.get("panel_services") or [])
+        if service in svc:
+            svc.remove(service)
+        else:
+            svc.append(service)
+        # 面板允许全空（用户可只看菜单栏）
+        self._state["panel_services"] = svc
+        _save_state(self._state)
+        self._update_panel_checks()
+        self._render()
+        self._kick_background_fetch()
+
+    def _make_set_bar_style(self, style):
+        return lambda _: self._set_bar_style(style)
+
+    def _set_bar_style(self, style):
+        if style not in _BAR_STYLES:
+            return
+        self._state["bar_style"] = style
+        _save_state(self._state)
+        self._update_bar_checks()
+        self._render()
 
     def _toggle_login_item(self, _):
         _set_login_item(not _login_item_enabled())
@@ -951,15 +1030,32 @@ class AiLimitApp(rumps.App):
         suffix = " ✓" if enabled else ""
         self._login_item.title = _tr(lang, "开机自启", "Launch at Login") + suffix
 
-    def _update_service_checks(self):
+    def _update_bar_checks(self):
         lang = self._lang()
-        svc = self._state.get("services") or list(_SERVICES)
-        self._svc_claude.title = ("✓ " if "claude" in svc else "  ") + "Claude Code"
-        self._svc_codex.title  = ("✓ " if "codex"  in svc else "  ") + "CodeX"
-        summary = _tr(lang, "全部", "All") if len(svc) == 2 else (
-            "Claude Code" if "claude" in svc else "CodeX"
+        bar = self._state.get("bar_services") or list(_SERVICES)
+        self._bar_claude.title = ("✓ " if "claude" in bar else "  ") + "Claude Code"
+        self._bar_codex.title  = ("✓ " if "codex"  in bar else "  ") + "CodeX"
+        style = self._state.get("bar_style", "both")
+        self._bar_style_both.title = ("✓ " if style == "both"    else "  ") + _tr(lang, "数字 + 电池", "Number + battery")
+        self._bar_style_num.title  = ("✓ " if style == "number"  else "  ") + _tr(lang, "仅数字", "Number only")
+        self._bar_style_bat.title  = ("✓ " if style == "battery" else "  ") + _tr(lang, "仅电池", "Battery only")
+        summary = _tr(lang, "全部", "All") if len(bar) == 2 else (
+            "Claude Code" if "claude" in bar else "CodeX"
         )
-        self._svc_menu.title = _tr(lang, f"监控服务（{summary}）", f"Services ({summary})")
+        self._bar_menu.title = _tr(lang, f"菜单栏图标（{summary}）", f"Menu bar icons ({summary})")
+
+    def _update_panel_checks(self):
+        lang = self._lang()
+        panel = self._state.get("panel_services") or []
+        self._panel_claude.title = ("✓ " if "claude" in panel else "  ") + "Claude Code"
+        self._panel_codex.title  = ("✓ " if "codex"  in panel else "  ") + "CodeX"
+        if not panel:
+            summary = _tr(lang, "无", "None")
+        elif len(panel) == 2:
+            summary = _tr(lang, "全部", "All")
+        else:
+            summary = "Claude Code" if "claude" in panel else "CodeX"
+        self._panel_menu.title = _tr(lang, f"详情面板（{summary}）", f"Detail panel ({summary})")
 
     # ── 立即刷新 ──────────────────────────────────────────────────────────────
 

@@ -29,7 +29,19 @@ Lives in the menu bar, shows live quota at a glance — no terminal needed. Beca
 curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.sh | bash
 ```
 
-First launch: right-click the app → Open → Open Anyway (bypasses Gatekeeper; the app is not notarized)
+**First launch — bypass Gatekeeper** (the app is not notarized)
+
+macOS blocks the app the first time. Use whichever matches your macOS version:
+
+- **macOS 15 Sequoia and later:** double-click the app. You'll see the dialog below (only **Done** / **Move to Trash** — there is no "Open" button anymore). Click **Done**, then open **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to ""ai-limit.app" was blocked…". Confirm with your password / Touch ID.
+- **macOS 14 Sonoma and earlier:** right-click (Control-click) the app → **Open** → **Open** in the dialog.
+
+<table><tr>
+  <td><img src="docs/install-blocked-dialog.png" width="300" /></td>
+  <td><img src="docs/install-open-anyway.png" width="440" /></td>
+</tr></table>
+
+> The screenshots are from a Chinese-language system. On an English system the same dialogs read: **"ai-limit.app" Not Opened** / **Done** / **Move to Trash**, and **Privacy & Security → Open Anyway**.
 
 **Features**
 

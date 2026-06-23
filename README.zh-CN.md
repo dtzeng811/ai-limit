@@ -29,7 +29,17 @@
 curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.sh | bash
 ```
 
-首次启动：右键点击 App → 打开 → 仍要打开（绕过 Gatekeeper，App 尚未公证）
+**首次启动 — 绕过 Gatekeeper**（App 尚未公证）
+
+首次打开会被 macOS 拦下，按你的系统版本二选一：
+
+- **macOS 15 Sequoia 及以后：** 双击 App，会弹出下图左侧的对话框（只有「完成 / 移到废纸篓」，**已经没有「打开」按钮**）。点「完成」，然后打开**系统设置 → 隐私与安全性**，下滚到「安全性」，在「已阻止 ai-limit.app…」处点**「仍要打开」**，再用密码 / 触控 ID 确认。
+- **macOS 14 Sonoma 及更早：** 右键（Control 点按）App → **打开** → 对话框里再点**打开**。
+
+<table><tr>
+  <td><img src="docs/install-blocked-dialog.png" width="300" /></td>
+  <td><img src="docs/install-open-anyway.png" width="440" /></td>
+</tr></table>
 
 **功能**
 

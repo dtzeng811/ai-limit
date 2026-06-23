@@ -470,7 +470,9 @@ def _render_attributed_title(items, style="both"):
                 mas.appendAttributedString_(bat_attach)
 
     if mas.length() == 0:
-        append_text("ai-limit ⚠️")
+        # 冷启动还没抓到数据：菜单栏不允许全空，故空列表只可能是加载态，
+        # 显示中性「加载中」省略号，不要用 ⚠️（那是真·抓取失败的语义）
+        append_text("ai-limit…")
     return mas
 
 
@@ -786,13 +788,15 @@ class AiLimitApp(rumps.App):
         bar_items = []
         if "claude" in bar_svc:
             if "error" in claude:
-                bar_items.append(("Claude", 0, True))
+                if claude["error"] != "no_data":   # no_data=还没读到数据,跳过(全跳过则落到兜底 ai-limit…);not_logged_in/异常才报 ⚠️
+                    bar_items.append(("Claude", 0, True))
             elif claude:
                 pct = claude["5h_left"] if mode == "5h" else claude["7d_left"]
                 bar_items.append(("Claude", pct, False))
         if "codex" in bar_svc:
             if "error" in codex:
-                bar_items.append(("CodeX", 0, True))
+                if codex["error"] != "no_data":   # 同上:no_data 跳过,not_logged_in/异常才报 ⚠️
+                    bar_items.append(("CodeX", 0, True))
             elif codex:
                 pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
                 bar_items.append(("CodeX", pct, False))
@@ -810,7 +814,7 @@ class AiLimitApp(rumps.App):
                     parts.append(f"{lbl} {_native_bar(pct)}")
                 else:
                     parts.append(f"{lbl} {pct}% {_native_bar(pct)}")
-            _set_bar_title(self, "  ".join(parts) if parts else "ai-limit ⚠️")
+            _set_bar_title(self, "  ".join(parts) if parts else "ai-limit…")
 
         # Claude 区块 —— 服务被关时整段隐藏
         self._claude_header._menuitem.setHidden_(not show_claude)

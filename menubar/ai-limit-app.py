@@ -504,9 +504,13 @@ def _inert(menu_item):
     return menu_item
 
 def _detail_text(mode, pct, reset, lang):
+    # U+2007 figure space = same pixel width as a digit; prevents tab-stop drift
+    # when single-digit pct gets 2 ASCII spaces (narrower than 2 digits)
+    fig = " "
+    pct_padded = str(pct).rjust(3, fig)
     if lang == "en":
-        return f"  {mode}\t{pct:>3}% left   \t↻ {reset}"
-    return f"  {mode}\t{pct:>3}% 剩余\t↻ {reset}"
+        return f"  {mode}\t{pct_padded}% left   \t↻ {reset}"
+    return f"  {mode}\t{pct_padded}% 剩余\t↻ {reset}"
 
 # ── 主 App ────────────────────────────────────────────────────────────────────
 

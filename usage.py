@@ -28,7 +28,7 @@ CODEX_BASE = pathlib.Path.home() / ".codex" / "sessions"
 _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.16"
+__version__ = "0.3.17"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -110,6 +110,23 @@ def t(zh: str, en: str) -> str:
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
+
+# Statuspage.io 官方公开只读 API，无需鉴权；components.json 是全量组件列表
+# （summary.json 只含 showcase=true 的组件，OpenAI 的 CLI/App 这些不在其中）
+CLAUDE_STATUS_COMPONENTS_URL = "https://status.claude.com/api/v2/components.json"
+CODEX_STATUS_COMPONENTS_URL = "https://status.openai.com/api/v2/components.json"
+CLAUDE_STATUS_PAGE_URL = "https://status.claude.com/"
+CODEX_STATUS_PAGE_URL = "https://status.openai.com/"
+
+# Statuspage 组件 status 取值的严重度排序，用于多选取最差
+STATUS_SEVERITY = {
+    "operational": 0,
+    "under_maintenance": 1,
+    "degraded_performance": 2,
+    "partial_outage": 3,
+    "major_outage": 4,
+    "critical": 4,
+}
 
 
 
@@ -281,6 +298,44 @@ def _claude_web_context(referer: str) -> tuple[str, dict]:
         "User-Agent": _chrome_ua(),
     }
     return org_id, headers
+
+
+def fetch_status_components(url: str, timeout: int = 5) -> list[dict] | None:
+    """拉 Statuspage components.json，返回 [{'id','name','status'}] 全量列表。
+    超时/网络错误重试一次；两次都失败返回 None——调用方不能拿 None 当"维持上次的值",
+    必须显式展示"未知"，呼应额度数据不能用旧值兜底的同一条原则。"""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": _chrome_ua(),
+    })
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+            return [
+                {"id": c["id"], "name": c["name"], "status": c["status"]}
+                for c in data.get("components", [])
+            ]
+        except Exception:
+            if attempt == 0:
+                continue
+            return None
+
+
+def worst_status(components: list[dict], selected_names: list[str]) -> tuple[str, str] | None:
+    """从 components 里按 selected_names 过滤，取严重度最差的一项。
+    并列时按 selected_names 里的顺序取排在前面的那个。
+    没有任何组件命中 selected_names 时返回 None（勾选项在接口里消失了，或列表为空）。"""
+    order = {name: i for i, name in enumerate(selected_names)}
+    matched = [c for c in components if c["name"] in order]
+    if not matched:
+        return None
+    matched.sort(key=lambda c: (-STATUS_SEVERITY.get(c["status"], 0), order[c["name"]]))
+    worst = matched[0]
+    return worst["status"], worst["name"]
 
 
 def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:

@@ -29,9 +29,9 @@ Lives in the menu bar, shows live quota at a glance — no terminal needed. Beca
 curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.sh | bash
 ```
 
-**First launch — bypass Gatekeeper** (the app is not notarized)
+**First launch**
 
-macOS blocks the app the first time. Use whichever matches your macOS version:
+The app is signed with a Developer ID and notarized by Apple, so it should open normally — no Gatekeeper bypass needed. If macOS still blocks it (e.g. the notarization/certificate has lapsed), use whichever matches your macOS version:
 
 - **macOS 15 Sequoia and later:** double-click the app. You'll see the dialog below (only **Done** / **Move to Trash** — there is no "Open" button anymore). Click **Done**, then open **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to ""ai-limit.app" was blocked…". Confirm with your password / Touch ID.
 - **macOS 14 Sonoma and earlier:** right-click (Control-click) the app → **Open** → **Open** in the dialog.

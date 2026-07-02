@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.
 
 App 已用 Developer ID 签名并通过 Apple 公证，正常情况下双击即可打开，无需绕过 Gatekeeper。如果 macOS 仍然拦截（比如公证/证书过期失效），按你的系统版本二选一：
 
-- **macOS 15 Sequoia 及以后：** 双击 App，会弹出下图左侧的对话框（只有「完成 / 移到废纸篓」，**已经没有「打开」按钮**）。点「完成」，然后打开**系统设置 → 隐私与安全性**，下滚到「安全性」，在「已阻止 ai-limit.app…」处点**「仍要打开」**，再用密码 / 触控 ID 确认。
+- **macOS 15 Sequoia 及以后：** 双击 App，会弹出下图左侧的对话框（只有「完成 / 移到废纸篓」，**已经没有「打开」按钮**）。点「完成」，然后打开**系统设置 → 隐私与安全性**，下滚到「安全性」，在「已阻止 AI Limit.app…」处点**「仍要打开」**，再用密码 / 触控 ID 确认。
 - **macOS 14 Sonoma 及更早：** 右键（Control 点按）App → **打开** → 对话框里再点**打开**。
 
 <table><tr>

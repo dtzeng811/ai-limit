@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.
 
 The app is signed with a Developer ID and notarized by Apple, so it should open normally — no Gatekeeper bypass needed. If macOS still blocks it (e.g. the notarization/certificate has lapsed), use whichever matches your macOS version:
 
-- **macOS 15 Sequoia and later:** double-click the app. You'll see the dialog below (only **Done** / **Move to Trash** — there is no "Open" button anymore). Click **Done**, then open **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to ""ai-limit.app" was blocked…". Confirm with your password / Touch ID.
+- **macOS 15 Sequoia and later:** double-click the app. You'll see the dialog below (only **Done** / **Move to Trash** — there is no "Open" button anymore). Click **Done**, then open **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to ""AI Limit.app" was blocked…". Confirm with your password / Touch ID.
 - **macOS 14 Sonoma and earlier:** right-click (Control-click) the app → **Open** → **Open** in the dialog.
 
 <table><tr>
@@ -41,7 +41,7 @@ The app is signed with a Developer ID and notarized by Apple, so it should open 
   <td><img src="docs/install-open-anyway.png" width="440" /></td>
 </tr></table>
 
-> The screenshots are from a Chinese-language system. On an English system the same dialogs read: **"ai-limit.app" Not Opened** / **Done** / **Move to Trash**, and **Privacy & Security → Open Anyway**.
+> The screenshots are from a Chinese-language system. On an English system the same dialogs read: **"AI Limit.app" Not Opened** / **Done** / **Move to Trash**, and **Privacy & Security → Open Anyway**.
 
 **Features**
 

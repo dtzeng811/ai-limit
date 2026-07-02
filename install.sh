@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO="zhuchenxi113/ai-limit"
-APP_NAME="ai-limit.app"
+APP_NAME="AI Limit.app"
 INSTALL_DIR="/Applications"
 
 # ── 颜色输出 ────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ ok "ai-limit ${VERSION} 已安装到 ${INSTALL_DIR}/${APP_NAME}"
 # ── 提示 ──────────────────────────────────────────────────────────────────────
 printf "\n"
 warn "首次启动提示（App 尚未公证）："
-printf "    右键点击 ai-limit.app → 打开 → 仍要打开\n"
+printf "    右键点击 AI Limit.app → 打开 → 仍要打开\n"
 printf "\n"
 info "直接打开："
 printf "    open \"${INSTALL_DIR}/${APP_NAME}\"\n"

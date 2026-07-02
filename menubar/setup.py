@@ -25,11 +25,12 @@ OPTIONS = {
     "includes": ["usage"],
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示
-        "CFBundleName": "ai-limit",
-        "CFBundleDisplayName": "ai-limit",
+        "CFBundleName": "AI Limit",
+        "CFBundleDisplayName": "AI Limit",
+        "CFBundleExecutable": "ai-limit",             # 保持可执行文件名/进程名稳定，不随显示名变化
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit",
-        "CFBundleVersion": "0.3.17",
-        "CFBundleShortVersionString": "0.3.17",
+        "CFBundleVersion": "0.3.18",
+        "CFBundleShortVersionString": "0.3.18",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

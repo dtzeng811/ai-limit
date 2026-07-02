@@ -115,7 +115,7 @@ _GITEE_RELEASES_API_URL  = "https://gitee.com/api/v5/repos/zhuchenxi113/ai-limit
 _GITEE_RELEASES_PAGE_URL = "https://gitee.com/zhuchenxi113/ai-limit/releases"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
 _LAUNCH_AGENT_PLIST = pathlib.Path.home() / "Library/LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
-_APP_EXECUTABLE     = pathlib.Path("/Applications/ai-limit.app/Contents/MacOS/ai-limit")
+_APP_EXECUTABLE     = pathlib.Path("/Applications/AI Limit.app/Contents/MacOS/ai-limit")
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 

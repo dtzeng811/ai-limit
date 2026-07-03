@@ -6,9 +6,15 @@ py2app 打包：cd menubar && python3 setup.py py2app
 """
 import datetime
 import json
+import os
 import pathlib
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 
 import rumps
@@ -117,6 +123,14 @@ _RELEASES_PAGE_URL = _PROJECT_URL + "/releases"
 # （曾返回 v0.3.10 而实际最新是 v0.3.11）；改用列表按创建时间倒序取第一条才准确。
 _GITEE_RELEASES_API_URL  = "https://gitee.com/api/v5/repos/zhuchenxi113/ai-limit/releases?per_page=1&direction=desc"
 _GITEE_RELEASES_PAGE_URL = "https://gitee.com/zhuchenxi113/ai-limit/releases"
+# 一键更新：只测试用，指向本地 file:// JSON，覆盖 GitHub/Gitee 两个真实源，
+# 用于 Stage 3 端到端联调（不依赖真实公开 Release）。生产环境不设置这个变量。
+_RELEASE_FEED_OVERRIDE = os.environ.get("AI_LIMIT_RELEASE_FEED_OVERRIDE")
+# Release 资产文件名约定：ai-limit-<version>.dmg（RUNBOOK.md 有明确要求不能改）。
+# Gitee releases 接口会混入自动生成的 v<version>.zip/.tar.gz 源码包，必须按文件名过滤。
+_DMG_ASSET_RE = re.compile(r"^ai-limit-.*\.dmg$")
+_UPDATE_FAILED_MARKER = pathlib.Path.home() / ".ai-limit-update-failed.json"
+_UPDATER_SCRIPT_NAME = "ai-limit-updater.sh"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
 _LAUNCH_AGENT_PLIST = pathlib.Path.home() / "Library/LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
 _APP_EXECUTABLE     = pathlib.Path("/Applications/AI Limit.app/Contents/MacOS/ai-limit")
@@ -161,7 +175,6 @@ def _tr(lang, zh, en):
 def _version_tuple(v: str):
     # 容忍预发布后缀（如 0.3.13-dev / 0.3.13-rc1）：每段只取前导数字，无数字记 0，
     # 避免 int("13-dev") 抛 ValueError 导致「检查更新」静默不弹窗。
-    import re
     out = []
     for p in v.lstrip("v").split("."):
         m = re.match(r"\d+", p)
@@ -182,10 +195,20 @@ def _show_alert(title, message, ok, cancel=None) -> bool:
         alert.addButtonWithTitle_(cancel)
     return alert.runModal() == AppKit.NSAlertFirstButtonReturn
 
+def _pick_dmg_asset(assets):
+    """从 Release assets[] 里挑出 ai-limit-<version>.dmg。Gitee 会混入自动生成的
+    源码包（v0.3.19.zip/.tar.gz），必须按文件名过滤，不能直接取 assets[0]。
+    找不到返回 (None, None)（防御性：某次发版忘了传 DMG 资产）。"""
+    for a in assets or []:
+        name = a.get("name", "")
+        if _DMG_ASSET_RE.match(name):
+            return a.get("browser_download_url"), name
+    return None, None
+
 def _fetch_latest_release_info(timeout=6) -> dict:
-    """后台线程调用：查最新 Release tag。优先 GitHub；连不上（常见于未配代理
-    的用户，GitHub 在国内常被墙）时退到 Gitee（国内可直连）。不抛异常，
-    两边都失败才返回 {"error": True}。"""
+    """后台线程调用：查最新 Release tag + DMG 资产下载链接。优先 GitHub；连不上
+    （常见于未配代理的用户，GitHub 在国内常被墙）时退到 Gitee（国内可直连）。
+    不抛异常，两边都失败才返回 {"error": True}。"""
     import urllib.request
 
     def _get_json(url):
@@ -196,17 +219,200 @@ def _fetch_latest_release_info(timeout=6) -> dict:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
 
+    def _result(latest, source, assets):
+        out = {"latest": latest, "source": source}
+        asset_url, asset_name = _pick_dmg_asset(assets)
+        if asset_url:
+            out["asset_url"] = asset_url
+            out["asset_name"] = asset_name
+        return out
+
+    # 仅测试用：指向本地 file://JSON，覆盖 GitHub/Gitee 两个真实源，用于离线
+    # 端到端联调（Stage 3），不发布真实公开 Release 也能走通全流程。
+    if _RELEASE_FEED_OVERRIDE:
+        try:
+            data = _get_json(_RELEASE_FEED_OVERRIDE)
+            return _result(data["tag_name"].lstrip("v"), "github", data.get("assets"))
+        except Exception:
+            return {"error": True}
+
     try:
         data = _get_json(_RELEASES_API_URL)
-        return {"latest": data["tag_name"].lstrip("v"), "source": "github"}
+        return _result(data["tag_name"].lstrip("v"), "github", data.get("assets"))
     except Exception:
         pass
 
     try:
         data = _get_json(_GITEE_RELEASES_API_URL)
-        return {"latest": data[0]["tag_name"].lstrip("v"), "source": "gitee"}
+        return _result(data[0]["tag_name"].lstrip("v"), "gitee", data[0].get("assets"))
     except Exception:
         return {"error": True}
+
+# ── 一键更新：下载 + 签名公证校验 ────────────────────────────────────────────
+# 这两个函数故意设计成不依赖 self，可以脱离整个 rumps App 独立测试
+# （见私仓 docs/adr/0004-in-app-auto-update.md 的 Stage 1 测试策略）。
+
+class _UpdateFailed(Exception):
+    """下载/校验任一步失败时抛出，被上层统一捕获归一化成
+    {"ok": False, "reason": ..., "detail": ...} 结果。"""
+    def __init__(self, reason, detail):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}")
+
+_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024  # 硬上限，防止响应异常导致无限写入
+
+def _download_release_dmg(url, dest_dir, timeout=30, total_timeout=600):
+    """下载 Release DMG 到 dest_dir/update.dmg。分块读取，Content-Length 存在时
+    核对字节数一致，全部写完才 os.replace 原子改名——中断产物（.part）不会被
+    误认成下载完成。磁盘空间检查基于 dest_dir 所在卷：标准单卷 Mac 上 tmp 目录
+    和 /Applications 是同一个 APFS 容器，检查 dest_dir 足够，不需要分别查两处。"""
+    import urllib.request
+
+    dest_dir = pathlib.Path(dest_dir)
+    part_path = dest_dir / "update.dmg.part"
+    final_path = dest_dir / "update.dmg"
+
+    req = urllib.request.Request(url, headers={"User-Agent": "ai-limit-menubar"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        raise _UpdateFailed("download_failed", f"无法连接下载地址：{e}") from e
+
+    with resp:
+        declared_size = resp.headers.get("Content-Length")
+        declared_size = int(declared_size) if declared_size and declared_size.isdigit() else None
+
+        if declared_size:
+            need = declared_size * 3
+            free = shutil.disk_usage(dest_dir).free
+            if free < need:
+                raise _UpdateFailed(
+                    "insufficient_disk_space",
+                    f"磁盘空间不足：需要约 {need // (1024 * 1024)} MB，"
+                    f"剩余 {free // (1024 * 1024)} MB",
+                )
+
+        start = time.monotonic()
+        written = 0
+        try:
+            with open(part_path, "wb") as f:
+                while True:
+                    if time.monotonic() - start > total_timeout:
+                        raise _UpdateFailed("timeout", "下载耗时过长")
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > _MAX_DOWNLOAD_BYTES:
+                        raise _UpdateFailed("download_failed", "下载内容超出预期大小上限")
+                    f.write(chunk)
+        except _UpdateFailed:
+            raise
+        except Exception as e:
+            raise _UpdateFailed("download_failed", str(e)) from e
+
+    if written == 0:
+        raise _UpdateFailed("download_failed", "下载内容为空")
+    if declared_size is not None and written != declared_size:
+        raise _UpdateFailed(
+            "download_failed",
+            f"下载字节数不符：期望 {declared_size}，实际 {written}",
+        )
+
+    os.replace(part_path, final_path)
+    return final_path
+
+def _detach_dmg(mnt_dir, attempts=3):
+    for _ in range(attempts):
+        proc = subprocess.run(
+            ["hdiutil", "detach", str(mnt_dir), "-quiet"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            return
+        time.sleep(1)
+    subprocess.run(["hdiutil", "detach", str(mnt_dir), "-quiet", "-force"],
+                    capture_output=True, text=True, timeout=30)
+
+def _verify_dmg(dmg_path, expected_version, dest_dir):
+    """签名公证三连校验（与 RUNBOOK.md 发版校验同一套标准，不发明新标准）+
+    版本号交叉核对。全部通过后把 .app 复制出挂载点（detach 后挂载点内容不再
+    可用），返回校验通过的本地 .app 路径。任一步失败抛 _UpdateFailed。"""
+    dmg_path = pathlib.Path(dmg_path)
+    dest_dir = pathlib.Path(dest_dir)
+
+    proc = subprocess.run(
+        ["xcrun", "stapler", "validate", str(dmg_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0 or "The validate action worked!" not in proc.stdout:
+        raise _UpdateFailed("stapler_failed", (proc.stdout + proc.stderr).strip()[:500])
+
+    # spctl 的判定输出在 stderr，不是 stdout——实测确认，不能只看 stdout。
+    proc = subprocess.run(
+        ["spctl", "--assess", "--type", "install", "--verbose", str(dmg_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if (proc.returncode != 0
+            or "accepted" not in proc.stderr
+            or "Notarized Developer ID" not in proc.stderr):
+        raise _UpdateFailed("spctl_failed", (proc.stdout + proc.stderr).strip()[:500])
+
+    mnt_dir = dest_dir / "mnt"
+    mnt_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["hdiutil", "attach", str(dmg_path), "-mountpoint", str(mnt_dir),
+         "-nobrowse", "-readonly", "-quiet"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        raise _UpdateFailed("mount_failed", (proc.stdout + proc.stderr).strip()[:500])
+
+    try:
+        apps = list(mnt_dir.glob("*.app"))  # 不硬编码 "AI Limit.app"，对未来改名更健壮
+        if len(apps) != 1:
+            raise _UpdateFailed(
+                "app_not_found",
+                f"挂载点里找到 {len(apps)} 个 .app，期望恰好 1 个",
+            )
+        mounted_app = apps[0]
+
+        # 只检查签名（Authority=Developer ID Application），不要求内部 .app 自己
+        # 也带 "Notarization Ticket=stapled"——标准 sign-and-notarize.sh 流程只
+        # staple 外层 DMG，不单独 staple 里面的 .app（实测确认：正常构建的 DMG
+        # 挂载后 codesign -dv 内部 .app 没有这一行，只有历史事故修复时额外手工
+        # staple 过的那份特殊 DMG 才有）。公证/notarized 这件事已经由上面 DMG
+        # 级别的 stapler validate + spctl --assess 判定过，这里不重复要求。
+        proc = subprocess.run(
+            ["codesign", "-dv", "--verbose=2", str(mounted_app)],
+            capture_output=True, text=True, timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        if proc.returncode != 0 or "Authority=Developer ID Application" not in combined:
+            raise _UpdateFailed("codesign_failed", combined.strip()[:500])
+
+        # 版本号交叉核对：防止资产链接指向错误/过期的包（超出 RUNBOOK 三连，
+        # 呼应"额度数据失败不能沿用旧值"同一条原则——不能假装校验通过）。
+        proc = subprocess.run(
+            ["plutil", "-extract", "CFBundleShortVersionString", "raw",
+             str(mounted_app / "Contents/Info.plist")],
+            capture_output=True, text=True, timeout=10,
+        )
+        actual_version = proc.stdout.strip()
+        if proc.returncode != 0 or actual_version != expected_version:
+            raise _UpdateFailed(
+                "version_mismatch",
+                f"DMG 内版本号 {actual_version!r} 与预期 {expected_version!r} 不符",
+            )
+
+        verified_dir = dest_dir / "verified"
+        verified_dir.mkdir(parents=True, exist_ok=True)
+        target = verified_dir / mounted_app.name
+        shutil.copytree(mounted_app, target, symlinks=True)  # symlinks=True 等价 cp -R
+        return target
+    finally:
+        _detach_dmg(mnt_dir)
 
 def _native_bar(pct, width=4):
     filled = round(max(0, min(100, pct)) / 100 * width)
@@ -732,6 +938,10 @@ class AiLimitApp(rumps.App):
         self._update_checking = False
         self._update_pending = None
         self._update_lock = threading.Lock()
+        # 一键更新（下载+校验）：同样的后台线程写变量+锁 -> 主线程轮询模式
+        self._updating = False
+        self._download_pending = None
+        self._download_lock = threading.Lock()
         self._last_refresh_str = "…"   # 折进刷新频率子菜单标题，无单独菜单行
         self._build_menu()
         # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
@@ -983,7 +1193,41 @@ class AiLimitApp(rumps.App):
         """启动后立即用缓存重画 + 后台拉一次最新数据。"""
         self._refresh_from_cache()
         self._kick_background_fetch()
+        self._check_update_failure_marker()
+        # 仅测试用：Stage 3 端到端联调没有人工点"检查更新"菜单项的手段，
+        # 用同一个 autotest 环境变量在启动后自动触发一次，和上面跳过确认弹窗
+        # 是同一个开关、同一个含义——生产环境不会设置，行为不变。
+        if os.environ.get("AI_LIMIT_AUTOTEST_SKIP_CONFIRM") == "1":
+            self._check_for_updates(None)
         sender.stop()
+
+    def _check_update_failure_marker(self):
+        """一键更新 helper 脚本失败时会写这个 marker 文件，启动时检查一次、
+        提示一次、然后删除——只提示一次，不能反复弹。marker 内容损坏（比如写
+        到一半被打断）也当作"有失败发生但细节不明"处理，不能因为解析失败就
+        卡住启动。"""
+        if not _UPDATE_FAILED_MARKER.exists():
+            return
+        detail = ""
+        try:
+            data = json.loads(_UPDATE_FAILED_MARKER.read_text(encoding="utf-8"))
+            detail = data.get("detail", "")
+        except Exception:
+            pass
+        try:
+            _UPDATE_FAILED_MARKER.unlink()
+        except FileNotFoundError:
+            pass
+        lang = self._lang()
+        _show_alert(
+            _tr(lang, "自动更新失败", "Auto-Update Failed"),
+            _tr(lang,
+                f"已回退到当前版本 {__version__}。{detail}\n可前往下载页手动更新。",
+                f"Rolled back to current version {__version__}. {detail}\n"
+                "You can update manually from the download page.",
+            ),
+            ok=_tr(lang, "好", "OK"),
+        )
 
     def _auto_refresh(self, _):
         """按用户选择的频率后台拉一次（由 self._auto_timer 驱动，间隔可调）。"""
@@ -1024,6 +1268,39 @@ class AiLimitApp(rumps.App):
             self._update_checking = False
             self._check_update_item.title = _tr(self._lang(), "检查更新", "Check for Updates")
             self._show_update_result(update_result)
+
+        with self._download_lock:
+            download_result = self._download_pending
+            self._download_pending = None
+        if download_result is not None:
+            self._apply_download_result(download_result)
+
+    def _apply_download_result(self, result):
+        """一键更新的下载+校验结果，主线程消费。成功：不显示中间态，直接触发
+        退出重启（用户点"立即更新"时已经确认过，不加二次确认）。失败：复位
+        菜单文字 + 弹提示，保留"打开下载页"作为兜底出路。"""
+        lang = self._lang()
+        if result.get("ok"):
+            self._trigger_restart_update(result["app_path"])
+            return  # 即将退出，不需要再复位 self._updating
+
+        self._updating = False
+        self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
+        detail = result.get("detail", "")
+        opened = _show_alert(
+            _tr(lang, "更新失败", "Update Failed"),
+            _tr(lang,
+                f"自动更新未完成（{detail}）。是否打开下载页手动安装？",
+                f"Automatic update did not complete ({detail}). "
+                "Open the download page to install manually?",
+            ),
+            ok=_tr(lang, "打开下载页", "Open Download Page"),
+            cancel=_tr(lang, "取消", "Cancel"),
+        )
+        if opened:
+            page_url = (_GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee"
+                        else _RELEASES_PAGE_URL)
+            webbrowser.open(page_url)
 
     def _refresh_from_cache(self):
         """主线程瞬时操作：读短缓存重画，不碰网络。"""
@@ -1365,7 +1642,7 @@ class AiLimitApp(rumps.App):
     # ── 检查更新 ──────────────────────────────────────────────────────────────
 
     def _check_for_updates(self, _):
-        if self._update_checking:
+        if self._update_checking or self._updating:
             return
         self._update_checking = True
         self._check_update_item.title = _tr(self._lang(), "检查更新…", "Checking for updates…")
@@ -1400,18 +1677,119 @@ class AiLimitApp(rumps.App):
                 ok=_tr(lang, "好", "OK"),
             )
             return
-        opened = _show_alert(
-            _tr(lang, "发现新版本", "Update Available"),
-            _tr(lang,
-                f"最新版本 {latest}，当前版本 {__version__}。是否打开下载页？",
-                f"Latest version {latest}, current version {__version__}. Open the download page?",
-            ),
-            ok=_tr(lang, "打开下载页", "Open Download Page"),
-            cancel=_tr(lang, "取消", "Cancel"),
-        )
-        if opened:
-            page_url = _GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee" else _RELEASES_PAGE_URL
-            webbrowser.open(page_url)
+
+        if not result.get("asset_url"):
+            # 防御性兜底：没在 Release 里找到 DMG 资产（比如某次发版漏传），
+            # 回退到旧的"打开下载页"手动流程。
+            opened = _show_alert(
+                _tr(lang, "发现新版本", "Update Available"),
+                _tr(lang,
+                    f"最新版本 {latest}，当前版本 {__version__}。是否打开下载页？",
+                    f"Latest version {latest}, current version {__version__}. Open the download page?",
+                ),
+                ok=_tr(lang, "打开下载页", "Open Download Page"),
+                cancel=_tr(lang, "取消", "Cancel"),
+            )
+            if opened:
+                page_url = _GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee" else _RELEASES_PAGE_URL
+                webbrowser.open(page_url)
+            return
+
+        # 唯一一次确认：点了"立即更新"之后不再有二次确认，直接下载校验完就
+        # 退出重启（对齐 Claude App / Codex App / Trae 国际版的一键更新体验）。
+        # 仅测试用：Stage 3 端到端联调需要在真实冻结环境里跑通全流程但没有
+        # 人工点击 NSAlert 的手段，用一个显式的 autotest 环境变量跳过这一次
+        # 确认——只影响这一个弹窗，不影响其它任何提示；生产环境不会设置这个
+        # 变量，行为和现在完全一致。
+        if os.environ.get("AI_LIMIT_AUTOTEST_SKIP_CONFIRM") == "1":
+            update_now = True
+        else:
+            update_now = _show_alert(
+                _tr(lang, "发现新版本", "Update Available"),
+                _tr(lang,
+                    f"最新版本 {latest}，当前版本 {__version__}。是否立即更新？",
+                    f"Latest version {latest}, current version {__version__}. Update now?",
+                ),
+                ok=_tr(lang, "立即更新", "Update Now"),
+                cancel=_tr(lang, "取消", "Cancel"),
+            )
+        if update_now:
+            self._start_update(result)
+
+    def _start_update(self, result):
+        if self._updating:
+            return
+        self._updating = True
+        self._check_update_item.title = _tr(self._lang(), "更新中…", "Updating…")
+        threading.Thread(
+            target=self._async_download_and_verify_update,
+            args=(result["asset_url"], result["latest"], result.get("source")),
+            daemon=True,
+        ).start()
+
+    def _async_download_and_verify_update(self, asset_url, expected_version, source):
+        """后台线程：下载 + 签名公证校验一键更新的 DMG。不能调任何 rumps/AppKit
+        UI。任一步失败清理本次临时目录，成功则保留（helper 脚本负责最终清理）。"""
+        dest_dir = pathlib.Path(tempfile.mkdtemp(prefix="ai-limit-update-"))
+        try:
+            dmg_path = _download_release_dmg(asset_url, dest_dir)
+            app_path = _verify_dmg(dmg_path, expected_version, dest_dir)
+            result = {"ok": True, "app_path": app_path}
+        except _UpdateFailed as e:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            result = {"ok": False, "reason": e.reason, "detail": e.detail, "source": source}
+        except Exception as e:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            result = {"ok": False, "reason": "unexpected", "detail": str(e), "source": source}
+        with self._download_lock:
+            self._download_pending = result
+
+    def _trigger_restart_update(self, verified_app_path):
+        """校验通过后：把 helper 脚本拷到本次更新的临时目录、detached 启动、
+        立即退出主进程，交给 helper 完成"等旧进程退出 -> 替换 -> 拉起新版"。
+        目标路径动态推导（不硬编码 /Applications/AI Limit.app），非打包运行
+        环境（开发时直接跑 .py）直接拒绝，因为推导不出真实的 .app bundle。"""
+        lang = self._lang()
+        if not getattr(sys, "frozen", False):
+            self._updating = False
+            self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
+            _show_alert(
+                _tr(lang, "无法自动更新", "Cannot Auto-Update"),
+                _tr(lang,
+                    "当前不是打包运行环境，无法自动重启更新，请手动下载安装。",
+                    "Not running as a packaged app; cannot auto-restart. Please install manually.",
+                ),
+                ok=_tr(lang, "好", "OK"),
+            )
+            return
+
+        target_app = pathlib.Path(sys.executable).resolve().parents[2]
+        helper_src = target_app / "Contents" / "Resources" / _UPDATER_SCRIPT_NAME
+        dest_dir = verified_app_path.parent.parent  # <tmp>/verified/AI Limit.app -> <tmp>
+        helper_copy = dest_dir / _UPDATER_SCRIPT_NAME
+        log_path = dest_dir / "updater.log"
+
+        try:
+            shutil.copy2(helper_src, helper_copy)
+            os.chmod(helper_copy, 0o755)
+            subprocess.Popen(
+                [str(helper_copy), str(verified_app_path), str(target_app),
+                 str(os.getpid()), str(log_path), str(_UPDATE_FAILED_MARKER), str(dest_dir)],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except Exception as e:
+            self._updating = False
+            self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
+            _show_alert(
+                _tr(lang, "更新失败", "Update Failed"),
+                _tr(lang, f"无法启动更新程序：{e}", f"Could not start updater: {e}"),
+                ok=_tr(lang, "好", "OK"),
+            )
+            return
+
+        rumps.quit_application(None)
 
 
 if __name__ == "__main__":

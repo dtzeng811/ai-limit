@@ -23,14 +23,15 @@ OPTIONS = {
     "iconfile": "ai-limit.icns",
     "packages": ["rumps", "browser_cookie3", "Cryptodome"],
     "includes": ["usage"],
+    "resources": ["ai-limit-updater.sh"],  # 一键更新 helper 脚本，随 App 一起签名封印
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示
         "CFBundleName": "AI Limit",
         "CFBundleDisplayName": "AI Limit",
         "CFBundleExecutable": "ai-limit",             # 保持可执行文件名/进程名稳定，不随显示名变化
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit",
-        "CFBundleVersion": "0.3.19",
-        "CFBundleShortVersionString": "0.3.19",
+        "CFBundleVersion": "0.3.20",
+        "CFBundleShortVersionString": "0.3.20",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

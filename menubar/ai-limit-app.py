@@ -55,7 +55,9 @@ _SYSTEM_LANG = _detect_system_lang()
 
 _STATE_PATH   = pathlib.Path.home() / ".ai-limit-menubar.json"
 _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
+_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 _CACHE_TTL    = 55
+_HISTORY_RETENTION_SEC = 2 * 60 * 60
 _REFRESH_SEC  = 60               # 兜底默认（= 1 分钟）
 _REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
 _DISPLAY_MODES = ("5h", "7d")
@@ -323,6 +325,60 @@ def _save_cache(claude, codex):
                 "claude": claude,
                 "codex": codex,
             }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+def _history_snapshot(data):
+    if data is None:
+        return None
+    if isinstance(data, dict) and "error" in data:
+        return {"error": str(data.get("error", ""))[:200]}
+    if not isinstance(data, dict):
+        return None
+    return {
+        "5h_left": data.get("5h_left"),
+        "7d_left": data.get("7d_left"),
+        "5h_reset": data.get("5h_reset"),
+        "7d_reset": data.get("7d_reset"),
+        "plan": data.get("plan"),
+    }
+
+def _append_history(claude, codex):
+    """保留最近 2 小时菜单栏刷新结果，用于事后解释额度跳变。
+
+    只写归一化后的百分比/重置时间/错误文本，不记录 cookie、组织 ID、原始响应
+    或请求头。
+    """
+    try:
+        now = datetime.datetime.now(TZ_LOCAL)
+        entry = {
+            "ts": now.isoformat(timespec="seconds"),
+            "epoch": now.timestamp(),
+        }
+        if claude is not None:
+            entry["claude"] = _history_snapshot(claude)
+        if codex is not None:
+            entry["codex"] = _history_snapshot(codex)
+        if "claude" not in entry and "codex" not in entry:
+            return
+
+        cutoff = entry["epoch"] - _HISTORY_RETENTION_SEC
+        kept = []
+        try:
+            for line in _HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+                try:
+                    old = json.loads(line)
+                except Exception:
+                    continue
+                if float(old.get("epoch", 0)) >= cutoff:
+                    kept.append(old)
+        except FileNotFoundError:
+            pass
+        kept.append(entry)
+        _HISTORY_PATH.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in kept) + "\n",
             encoding="utf-8",
         )
     except Exception:
@@ -921,6 +977,7 @@ class AiLimitApp(rumps.App):
             if codex_status is not None:
                 self._codex_status_raw = codex_status
             _save_cache(self._claude, self._codex)
+            _append_history(claude, codex)
             self._render()
 
         with self._update_lock:

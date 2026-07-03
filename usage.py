@@ -26,6 +26,7 @@ import time
 CLAUDE_BASE = pathlib.Path.home() / ".claude" / "projects"
 CODEX_BASE = pathlib.Path.home() / ".codex" / "sessions"
 _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
+_MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
 __version__ = "0.3.18"
@@ -1190,6 +1191,77 @@ def render_summary():
     print(f"\n{_DIM}{SEP}{_RST}\n")
 
 
+def _fmt_history_service(data: dict | None) -> str:
+    if not data:
+        return "-"
+    if "error" in data:
+        return f"⚠️ {data.get('error')}"
+    h5 = data.get("5h_left")
+    d7 = data.get("7d_left")
+    h5_reset = data.get("5h_reset")
+    d7_reset = data.get("7d_reset")
+    parts = []
+    if h5 is not None:
+        reset = f" ↻ {_fmt_history_reset(h5_reset)}" if h5_reset else ""
+        parts.append(f"5h {h5}%{reset}")
+    if d7 is not None:
+        reset = f" ↻ {_fmt_history_reset(d7_reset)}" if d7_reset else ""
+        parts.append(f"7d {d7}%{reset}")
+    return " | ".join(parts) if parts else "-"
+
+
+def _fmt_history_reset(value) -> str:
+    if value is None:
+        return "?"
+    try:
+        if isinstance(value, (int, float)):
+            dt = epoch_to_local(int(value))
+        elif isinstance(value, str) and value.isdigit():
+            dt = epoch_to_local(int(value))
+        else:
+            dt = datetime.datetime.fromisoformat(str(value)).astimezone(TZ_LOCAL)
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def render_menubar_history(minutes: int = 120):
+    cutoff = datetime.datetime.now(TZ_LOCAL).timestamp() - minutes * 60
+    rows = []
+    try:
+        for line in _MENUBAR_HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if float(rec.get("epoch", 0)) >= cutoff:
+                rows.append(rec)
+    except FileNotFoundError:
+        print(t(
+            f"未找到菜单栏历史：{_MENUBAR_HISTORY_PATH}",
+            f"Menubar history not found: {_MENUBAR_HISTORY_PATH}",
+        ))
+        return
+
+    if not rows:
+        print(t("最近没有菜单栏历史采样。", "No recent menubar history samples."))
+        return
+
+    print(f"\n{_BOLD}{t('菜单栏历史采样', 'Menubar history')}{_RST}")
+    print(f"{_DIM}{_MENUBAR_HISTORY_PATH}{_RST}")
+    print()
+    for rec in rows:
+        ts = rec.get("ts", "?")
+        try:
+            ts = datetime.datetime.fromisoformat(str(ts)).astimezone(TZ_LOCAL).strftime("%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        claude = _fmt_history_service(rec.get("claude"))
+        codex = _fmt_history_service(rec.get("codex"))
+        print(f"{ts}  Claude: {claude}  |  CodeX: {codex}")
+    print()
+
+
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1202,7 +1274,13 @@ def main():
                         help=t("统计全部历史（忽略 --days）", "show all history (overrides --days)"))
     parser.add_argument("--detail", action="store_true",
                         help=t("展示每个模型的详细 token 统计", "show per-model token breakdown"))
+    parser.add_argument("--history", action="store_true",
+                        help=t("展示菜单栏最近 2 小时额度采样", "show menubar quota samples from the last 2 hours"))
     args = parser.parse_args()
+
+    if args.history:
+        render_menubar_history()
+        return
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 

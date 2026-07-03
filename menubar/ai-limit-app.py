@@ -79,13 +79,15 @@ _CLAUDE_STATUS_DEFAULT = ["Claude Code"]
 _CODEX_STATUS_ALL = ["App", "CLI", "Codex API", "VS Code extension", "Codex Web"]
 _CODEX_STATUS_DEFAULT = ["App", "CLI", "Codex API"]
 
-_STATUS_DOT = {
-    "operational": "🟢",
-    "under_maintenance": "🔧",
-    "degraded_performance": "🟡",
-    "partial_outage": "🟠",
-    "major_outage": "🔴",
-    "critical": "🔴",
+_STATUS_COLORS = {
+    # Claude Status 官方色系：status.claude.com 的 pageColorData。
+    "operational": "#76AD2A",
+    "under_maintenance": "#2C84DB",
+    "degraded_performance": "#FAA72A",
+    "partial_outage": "#E86235",
+    "major_outage": "#E04343",
+    "critical": "#E04343",
+    "unknown": "#B0AEA5",
 }
 # 父行状态圆点靠右贴的固定坐标（attributed string 右对齐 tab stop 用，
 # 单位 pt，从菜单项内容左边距算起）。不随 base_text 长度变化，也不会像
@@ -548,6 +550,35 @@ def _battery_attachment(pct, font):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
 
 
+def _nscolor_from_hex(hex_color):
+    raw = hex_color.lstrip("#")
+    try:
+        r = int(raw[0:2], 16) / 255
+        g = int(raw[2:4], 16) / 255
+        b = int(raw[4:6], 16) / 255
+    except Exception:
+        r = g = b = 0.6
+    return AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+
+
+def _status_dot_attachment(status, font):
+    size = 9.0
+    img = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(size, size))
+    img.lockFocus()
+    color = _nscolor_from_hex(_STATUS_COLORS.get(status, _STATUS_COLORS["unknown"]))
+    color.setFill()
+    AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+        AppKit.NSMakeRect(0, 0, size, size)
+    ).fill()
+    img.unlockFocus()
+
+    attach = AppKit.NSTextAttachment.alloc().init()
+    attach.setImage_(img)
+    y_offset = (font.capHeight() - size) / 2
+    attach.setBounds_(AppKit.NSMakeRect(0, y_offset, size, size))
+    return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
+
+
 def _render_attributed_title(items, style="both"):
     """构建状态栏 attributed title：文字交给 NSStatusBarButton 原生渲染（拿到
     系统 vibrancy 和亮暗自适应），电池作为内联 template image 附件。
@@ -617,8 +648,8 @@ def _inert(menu_item):
     menu_item.set_callback(_noop)
     return menu_item
 
-def _status_text(raw, selected, lang):
-    """算父行要贴右边的状态文字：'状态 🟢' 这种，不带组件名（具体是哪个组件
+def _status_info(raw, selected, lang):
+    """算父行要贴右边的状态信息：'状态 + 小圆点'，不带组件名（具体是哪个组件
     点开子菜单看），没有可显示内容时返回空串。
 
     raw: None(还没抓到，冷启动瞬间)/ "unknown"(抓取失败) / list(成功，全量组件)
@@ -627,18 +658,17 @@ def _status_text(raw, selected, lang):
     里的百分比数字混淆。
     """
     if not selected or raw is None:
-        return ""
+        return None
     label = _tr(lang, "状态", "Status")
     result = None if raw == "unknown" else worst_status(raw, selected)
     if result is None:
-        return f"{label} ❓"
+        return label, "unknown"
     status, _name = result
-    dot = _STATUS_DOT.get(status, "❓")
-    return f"{label} {dot}"
+    return label, status
 
 
-def _set_header_title(menu_item, base_text, status_text):
-    """父行标题：base_text 靠左正常渲染；status_text（若非空）用 attributed
+def _set_header_title(menu_item, base_text, status_info):
+    """父行标题：base_text 靠左正常渲染；status_info（若非空）用 attributed
     string 的右对齐 tab stop 贴到 _STATUS_RIGHT_TAB_X 这个固定坐标。
 
     为什么不用普通 title + 多个 '\\t'：左 tab 只会跳到"当前文字末尾之后的
@@ -648,10 +678,11 @@ def _set_header_title(menu_item, base_text, status_text):
     多长都精确落在同一列，且不会撑宽菜单。
     """
     ns_item = menu_item._menuitem
-    if not status_text:
+    if not status_info:
         ns_item.setAttributedTitle_(None)
         menu_item.title = base_text
         return
+    status_label, status = status_info
     para = AppKit.NSMutableParagraphStyle.alloc().init()
     tab = AppKit.NSTextTab.alloc().initWithTextAlignment_location_options_(
         AppKit.NSTextAlignmentRight, _STATUS_RIGHT_TAB_X, {}
@@ -661,8 +692,14 @@ def _set_header_title(menu_item, base_text, status_text):
         AppKit.NSParagraphStyleAttributeName: para,
         AppKit.NSFontAttributeName: AppKit.NSFont.menuFontOfSize_(0),
     }
-    attributed = AppKit.NSAttributedString.alloc().initWithString_attributes_(
-        f"{base_text}\t{status_text}", attrs)
+    font = AppKit.NSFont.menuFontOfSize_(0)
+    attributed = AppKit.NSMutableAttributedString.alloc().init()
+    attributed.appendAttributedString_(
+        AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            f"{base_text}\t{status_label} ", attrs)
+    )
+    dot = _status_dot_attachment(status, font)
+    attributed.appendAttributedString_(dot)
     ns_item.setAttributedTitle_(attributed)
 
 
@@ -1065,15 +1102,15 @@ class AiLimitApp(rumps.App):
         self._claude_5h._menuitem.setHidden_(not show_claude)
         self._claude_7d._menuitem.setHidden_(not show_claude)
         claude_sel = self._state.get("claude_status_components", _CLAUDE_STATUS_DEFAULT)
-        claude_status_text = _status_text(self._claude_status_raw, claude_sel, lang)
+        claude_status_info = _status_info(self._claude_status_raw, claude_sel, lang)
         if show_claude:
             if "error" in claude:
-                _set_header_title(self._claude_header, "Claude Code ⚠️", claude_status_text)
+                _set_header_title(self._claude_header, "Claude Code ⚠️", claude_status_info)
                 self._claude_5h.title = f"  {claude['error'][:60]}"
                 self._claude_7d._menuitem.setHidden_(True)
             elif claude:
                 plan = _fmt_plan(claude.get("plan"), lang)
-                _set_header_title(self._claude_header, f"Claude Code{plan}", claude_status_text)
+                _set_header_title(self._claude_header, f"Claude Code{plan}", claude_status_info)
                 c5_reset = _fmt_reset_iso(claude["5h_reset"], lang)
                 c7_reset = _fmt_reset_iso(claude["7d_reset"], lang)
                 self._claude_5h.title = _detail_text("5h", claude["5h_left"], c5_reset, lang)
@@ -1084,15 +1121,15 @@ class AiLimitApp(rumps.App):
         self._codex_5h._menuitem.setHidden_(not show_codex)
         self._codex_7d._menuitem.setHidden_(not show_codex)
         codex_sel = self._state.get("codex_status_components", _CODEX_STATUS_DEFAULT)
-        codex_status_text = _status_text(self._codex_status_raw, codex_sel, lang)
+        codex_status_info = _status_info(self._codex_status_raw, codex_sel, lang)
         if show_codex:
             if "error" in codex:
-                _set_header_title(self._codex_header, "CodeX ⚠️", codex_status_text)
+                _set_header_title(self._codex_header, "CodeX ⚠️", codex_status_info)
                 self._codex_5h.title = f"  {codex['error'][:60]}"
                 self._codex_7d._menuitem.setHidden_(True)
             elif codex:
                 plan = _fmt_plan(codex.get("plan"), lang)
-                _set_header_title(self._codex_header, f"CodeX{plan}", codex_status_text)
+                _set_header_title(self._codex_header, f"CodeX{plan}", codex_status_info)
                 x5_reset = _fmt_reset_epoch(codex["5h_reset"], lang)
                 x7_reset = _fmt_reset_epoch(codex["7d_reset"], lang)
                 self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)

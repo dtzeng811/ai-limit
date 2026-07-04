@@ -67,9 +67,9 @@ bash make-dmg.sh
 
 ### 效果
 
-![CLI 截图（英文）](docs/screenshot-cli-en.png)
+![CLI 截图（英文）](docs/screenshot-cli-v0321-en.png)
 
-![CLI 截图（中文）](docs/screenshot-cli.png)
+![CLI 截图（中文）](docs/screenshot-cli-v0321.png)
 
 ### 环境要求
 

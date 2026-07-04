@@ -69,9 +69,9 @@ Output language is detected automatically from your system locale.
 
 ### Preview
 
-![CLI screenshot (English)](docs/screenshot-cli-en.png)
+![CLI screenshot (English)](docs/screenshot-cli-v0321-en.png)
 
-![CLI screenshot (Chinese)](docs/screenshot-cli.png)
+![CLI screenshot (Chinese)](docs/screenshot-cli-v0321.png)
 
 ### Requirements
 

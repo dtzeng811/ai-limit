@@ -1095,13 +1095,13 @@ class AiLimitApp(rumps.App):
             "立即刷新" if lang == "zh" else "Refresh now",
             callback=self._force_refresh,
         )
-        self._codex_dash = rumps.MenuItem(
-            "打开 CodeX 分析页" if lang == "zh" else "Open CodeX analytics",
-            callback=lambda _: webbrowser.open("https://chatgpt.com/codex/cloud/settings/analytics"),
-        )
         self._claude_dash = rumps.MenuItem(
             "打开 Claude 用量页" if lang == "zh" else "Open Claude usage",
             callback=lambda _: webbrowser.open("https://claude.ai/settings/usage"),
+        )
+        self._codex_dash = rumps.MenuItem(
+            "打开 CodeX 分析页" if lang == "zh" else "Open CodeX analytics",
+            callback=lambda _: webbrowser.open("https://chatgpt.com/codex/cloud/settings/analytics"),
         )
 
         # 关于子菜单
@@ -1160,8 +1160,8 @@ class AiLimitApp(rumps.App):
             self._lang_menu,
             self._login_item,
             None,
-            self._codex_dash,
             self._claude_dash,
+            self._codex_dash,
             None,
             self._about_menu,
             None,
@@ -1501,8 +1501,8 @@ class AiLimitApp(rumps.App):
         """语言切换后，更新所有不依赖数据的菜单文字。"""
         lang = self._lang()
         self._refresh_item.title = _tr(lang, "立即刷新", "Refresh now")
-        self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
+        self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._about_menu.title  = _tr(lang,
             f"关于（ai-limit {__version__}）",
             f"About (ai-limit {__version__})",

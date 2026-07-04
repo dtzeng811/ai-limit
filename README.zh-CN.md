@@ -4,6 +4,8 @@
 
 官方下载地址：https://github.com/zhuchenxi113/ai-limit/releases
 
+官网：https://ai-limit.waitsugar.com
+
 查看 Claude Code 和 CodeX 的实时剩余额度与 token 消耗情况。支持 macOS 菜单栏 App 和命令行两种使用方式。
 
 如果觉得有用，欢迎给个 Star 鼓励作者：[GitHub](https://github.com/zhuchenxi113/ai-limit) · [Gitee](https://gitee.com/zhuchenxi113/ai-limit)

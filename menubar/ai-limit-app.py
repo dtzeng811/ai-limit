@@ -909,6 +909,50 @@ def _set_header_title(menu_item, base_text, status_info):
     ns_item.setAttributedTitle_(attributed)
 
 
+_ERROR_ROW_MAX_WIDTH = 210.0
+# 异常态详情行（⚠️ 出现时）的安全像素宽度上限，必须小于 _MENU_MIN_WIDTH（290pt）。
+# NSMenu 没有 maximumWidth，宽度由"最宽的那一行菜单项"自适应撑出来；正常态的
+# _detail_text / _set_header_title 都靠固定 tab-stop/字符预算精心控制过，不会超；
+# 但异常态曾经只按字符数 [:60] 截断错误文案，跟真实渲染像素宽度无关——英文错误
+# 句（如 "No Codex access (subscription required or re-login needed)"）实际渲染
+# 宽度远超 290pt，导致面板在报错时明显变宽。
+#
+# 这个值不是"文字宽度"本身的安全上限，而是"文字宽度 + NSMenuItem 自身的图标/
+# 勾选栏/边距开销"之后仍要落在 290pt 内的预算——实测这部分开销约 58~60pt（同样的
+# 文字用 NSAttributedString 量出的宽度和最终 NSMenu 真实宽度对不上，差的就是这个
+# 开销）。第一版直接把 250pt 当成文字宽度上限，忽略了这部分开销，导致报错文案裁到
+# 250pt 时，整行实际还是把菜单撑到了 306~312pt——比正常态的 290pt 宽一截，用户截图
+# 实测能看出来（对比两张图左边缘对不齐）。这版改成 210pt 是实测二分找出来的安全值
+# （220pt 实测仍是 290pt，235pt 实测变成 293pt，超了）。改这个值前必须用真机截图或
+# `size of menu 1 of menu bar item` 直接量 NSMenu 真实宽度核对，不能只算文字宽度。
+
+def _fit_error_text(prefix, text, max_width=_ERROR_ROW_MAX_WIDTH):
+    """把异常态提示文案按真实像素宽度（而非字符数）裁尾并加省略号，
+    确保这一行绝不会比正常态更宽、撑大整个下拉菜单。"""
+    font = AppKit.NSFont.menuFontOfSize_(0)
+    attrs = {AppKit.NSFontAttributeName: font}
+
+    def _width(s):
+        return AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            s, attrs
+        ).size().width
+
+    full = prefix + text
+    if _width(full) <= max_width:
+        return full
+    lo, hi = 0, len(text)
+    best = prefix + "…"
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = prefix + text[:mid].rstrip() + "…"
+        if _width(candidate) <= max_width:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def _detail_text(mode, pct, reset, lang):
     # U+2007 figure space = same pixel width as a digit; prevents tab-stop drift
     # when single-digit pct gets 2 ASCII spaces (narrower than 2 digits)
@@ -1383,7 +1427,7 @@ class AiLimitApp(rumps.App):
         if show_claude:
             if "error" in claude:
                 _set_header_title(self._claude_header, "Claude Code ⚠️", claude_status_info)
-                self._claude_5h.title = f"  {claude['error'][:60]}"
+                self._claude_5h.title = _fit_error_text("  ", claude["error"])
                 self._claude_7d._menuitem.setHidden_(True)
             elif claude:
                 plan = _fmt_plan(claude.get("plan"), lang)
@@ -1402,7 +1446,7 @@ class AiLimitApp(rumps.App):
         if show_codex:
             if "error" in codex:
                 _set_header_title(self._codex_header, "CodeX ⚠️", codex_status_info)
-                self._codex_5h.title = f"  {codex['error'][:60]}"
+                self._codex_5h.title = _fit_error_text("  ", codex["error"])
                 self._codex_7d._menuitem.setHidden_(True)
             elif codex:
                 plan = _fmt_plan(codex.get("plan"), lang)

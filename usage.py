@@ -29,7 +29,7 @@ _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 _MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.22"
+__version__ = "0.3.23"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -1082,6 +1082,76 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
         print(f"\n  ⚠️  {t('Claude 周额度百分比本地不可得', 'Claude quota unavailable locally')}  →  {CLAUDE_USAGE_URL}  ({t('Cmd+双击打开', 'Cmd+double-click to open')})")
 
 
+def _rolling_window_label(window_minutes):
+    """按窗口实际分钟数生成"N 小时滚动窗"/"N 天滚动窗"文案。
+
+    不能假设 Codex 固定是 5h+7d 两档：2026-07-13 起 OpenAI 后端把 5 小时窗口
+    并入了周窗口，primary_window 的 limit_window_seconds 变成了 604800（7 天），
+    但字段位置仍叫 primary——必须按实际时长算标签，不能按字段名硬编码。
+    """
+    if not window_minutes:
+        return t("额度窗口  ", "quota window ")
+    hours = window_minutes / 60
+    if hours < 24:
+        n = round(hours) or 1
+        return t(f"{n}小时滚动窗", f"{n}-hour window")
+    days = round(hours / 24)
+    return t(f"{days}天滚动窗  ", f"{days}-day window ")
+
+
+def _classify_codex_windows(rl):
+    """把 primary/secondary 两个 JSON 字段位置的窗口，按实际时长分成
+    "短窗口档"（约 5 小时一档）和"长窗口档"（约 7 天/更长一档），返回 (short, long)。
+
+    不能假设字段位置固定对应哪个时长：2026-07-13 OpenAI 临时移除 Codex 的 5 小时
+    限额后，唯一剩下的窗口出现在 primary_window 字段，但实际时长是 7 天——必须按
+    window_minutes 分类，不能按 JSON 字段名。官方说明是"temporarily"，5 小时档
+    随时可能恢复，所以两档都要固定展示（缺数据显示 "?"），不能因为这次没数据就把
+    整行隐藏掉，否则每次 OpenAI 开关这个限额，菜单栏布局就跟着忽隐忽现。
+    """
+    short = long = None
+    for w in (rl.get("primary"), rl.get("secondary")):
+        if not w:
+            continue
+        mins = w.get("window_minutes")
+        if not mins:
+            continue
+        if mins <= 360:   # ≤6 小时归"短窗口"档
+            short = w
+        else:
+            long = w
+    return short, long
+
+
+def _print_codex_window_row(label, window, *, source, data_age_min, now_local, missing_note):
+    """打印一档 Codex 额度窗口；window=None 时打印占位行（标签 + "?"）而不是
+    直接跳过——见 _classify_codex_windows 的 docstring，缺数据可能只是临时的。"""
+    if window is None:
+        print(f"  {label}  {_colored_bar(0)}  {t(f'剩余 ?  {_DIM}({missing_note}){_RST}', f'left ?  {_DIM}({missing_note}){_RST}')}")
+        return False
+    pct = window.get("used_percent", 0)
+    remaining = remaining_percent(pct)
+    reset = epoch_to_local(window["resets_at"]) if window.get("resets_at") else None
+    win_min = window.get("window_minutes") or 300
+    stale = source == "snapshot" and data_age_min > win_min
+    if stale:
+        if reset and now_local >= reset:
+            full_str = f"{_OK}{_BOLD}100%{_RST}"
+            print(f"  {label}  {_colored_bar(100)}  {t(f'剩余 {full_str}  {_DIM}(推断：CLI 无新记录，可能漏检 Cloud){_RST}', f'left {full_str}  {_DIM}(inferred: no new CLI usage; Cloud may be missed){_RST}')}")
+            print(f"  {_DIM}{t('重置时间', 'Reset at')}: {fmt_reset_dt(reset)}{_RST}")
+        elif reset:
+            print(f"  {label}  {_DIM}{t(f'快照已过期，预计 {fmt_reset_dt(reset)} 后恢复', f'snapshot expired, expected reset at {fmt_reset_dt(reset)}')}{_RST}")
+        else:
+            age_h = data_age_min / 60
+            print(f"  {label}  {_DIM}{t(f'快照已过期 ({age_h:.0f}h 前)', f'snapshot expired ({age_h:.0f}h ago)')}{_RST}  →  {CODEX_USAGE_URL}")
+    else:
+        r_str = f"{_bc(remaining)}{_BOLD}{remaining:.0f}%{_RST}"
+        print(f"  {label}  {_colored_bar(remaining)}  {t(f'剩余 {r_str}  {_DIM}(已用 {pct:.0f}%){_RST}', f'left {r_str}  {_DIM}(used {pct:.0f}%){_RST}')}")
+        if reset:
+            print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(reset)}{_RST}")
+    return stale
+
+
 def render_codex(since: datetime.datetime):
     title = "CodeX (OpenAI GPT-5)"
     print(f"\n{_DIM}{SEP}{_RST}")
@@ -1120,61 +1190,32 @@ def render_codex(since: datetime.datetime):
     print(f"  {t('套餐', 'Plan')}: {_BOLD}{fmt_plan(plan)}{_RST}")
     print()
 
-    secondary = rl.get("secondary") or {}
-    primary = rl.get("primary") or {}
-
     data_age_min = (now_local - ts_local).total_seconds() / 60
 
-    # 5-hour window
-    p_pct = primary.get("used_percent", 0)
-    p_remaining = remaining_percent(p_pct)
-    p_reset = epoch_to_local(primary["resets_at"]) if primary.get("resets_at") else None
-    p_min = primary.get("window_minutes", 300)
-    p_stale = source == "snapshot" and data_age_min > p_min
-    p_label = t("5小时滚动窗", "5-hour window")
+    # 按实际 window_minutes 把窗口分到"短档"（约 5 小时）/"长档"（约 7 天）；
+    # 两档都固定打印，缺数据显示 "?"（见 _classify_codex_windows 的 why）。
+    short_win, long_win = _classify_codex_windows(rl)
 
-    if p_stale:
-        if p_reset and now_local >= p_reset:
-            # 快照过期且窗口重置时间已过；web/live 都失败 → 保守推断已重置
-            full_str = f"{_OK}{_BOLD}100%{_RST}"
-            print(f"  {p_label}  {_colored_bar(100)}  {t(f'剩余 {full_str}  {_DIM}(推断：CLI 无新记录，可能漏检 Cloud){_RST}', f'left {full_str}  {_DIM}(inferred: no new CLI usage; Cloud may be missed){_RST}')}")
-            print(f"  {_DIM}{t('重置时间', 'Reset at')}: {fmt_reset_dt(p_reset)}{_RST}")
-        elif p_reset:
-            print(f"  {p_label}  {_DIM}{t(f'快照已过期，预计 {fmt_reset_dt(p_reset)} 后恢复', f'snapshot expired, expected reset at {fmt_reset_dt(p_reset)}')}{_RST}")
-        else:
-            age_h = data_age_min / 60
-            print(f"  {p_label}  {_DIM}{t(f'快照已过期 ({age_h:.0f}h 前)', f'snapshot expired ({age_h:.0f}h ago)')}{_RST}  →  {CODEX_USAGE_URL}")
-    else:
-        p_r_str = f"{_bc(p_remaining)}{_BOLD}{p_remaining:.0f}%{_RST}"
-        print(f"  {p_label}  {_colored_bar(p_remaining)}  {t(f'剩余 {p_r_str}  {_DIM}(已用 {p_pct:.0f}%){_RST}', f'left {p_r_str}  {_DIM}(used {p_pct:.0f}%){_RST}')}")
-        if p_reset:
-            print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(p_reset)}{_RST}")
+    short_label = _rolling_window_label(short_win["window_minutes"]) if short_win else t("5小时滚动窗", "5-hour window")
+    _print_codex_window_row(
+        short_label, short_win,
+        source=source, data_age_min=data_age_min, now_local=now_local,
+        missing_note=t("OpenAI 当前临时移除该档限额，预计后续恢复", "OpenAI has temporarily removed this tier, expected to return"),
+    )
     print()
 
-    # 7-day window
-    w_pct = secondary.get("used_percent", 0)
-    w_remaining = remaining_percent(w_pct)
-    w_reset = epoch_to_local(secondary["resets_at"]) if secondary.get("resets_at") else None
-    w_min = secondary.get("window_minutes", 10080)
-    if w_min:
-        days = w_min // 60 // 24
-        w_label = t(f"{days}天滚动窗  ", f"{days}-day window ")
-    else:
-        w_label = t("周额度    ", "Weekly quota")
-    w_stale = bool(source == "snapshot" and w_min and data_age_min > w_min)
-    w_r_str = f"{_bc(w_remaining)}{_BOLD}{w_remaining:.0f}%{_RST}"
-    if w_stale and w_reset and now_local >= w_reset:
-        full_str = f"{_OK}{_BOLD}100%{_RST}"
-        print(f"  {w_label}  {_colored_bar(100)}  {t(f'剩余 {full_str}  {_DIM}(推断：已重置){_RST}', f'left {full_str}  {_DIM}(inferred: reset){_RST}')}")
-        print(f"  {_DIM}{t('重置时间', 'Reset at')}: {fmt_reset_dt(w_reset)}{_RST}")
-    else:
-        age_note = f"  {_DIM}{t(f'{data_age_min/60:.0f}h 前快照', f'snapshot {data_age_min/60:.0f}h ago')}{_RST}" if p_stale else ""
-        print(f"  {w_label}  {_colored_bar(w_remaining)}  {t(f'剩余 {w_r_str}  {_DIM}(已用 {w_pct:.0f}%){_RST}', f'left {w_r_str}  {_DIM}(used {w_pct:.0f}%){_RST}')}{age_note}")
-        if w_reset:
-            print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(w_reset)}{_RST}")
+    long_label = _rolling_window_label(long_win["window_minutes"]) if long_win else t("7天滚动窗  ", "7-day window ")
+    _print_codex_window_row(
+        long_label, long_win,
+        source=source, data_age_min=data_age_min, now_local=now_local,
+        missing_note=t("本次未返回该档数据", "not returned this time"),
+    )
+    w_pct = long_win.get("used_percent", 0) if long_win else None
+    w_reset = epoch_to_local(long_win["resets_at"]) if long_win and long_win.get("resets_at") else None
+    w_min = (long_win.get("window_minutes") if long_win else None) or 10080
 
     # remaining quota estimate
-    if w_pct and w_reset:
+    if long_win is not None and w_pct and w_reset:
         remaining_pct = 100 - w_pct
         elapsed_since_reset = (
             datetime.timedelta(minutes=w_min)

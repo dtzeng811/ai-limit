@@ -28,6 +28,7 @@ from usage import (
     live_claude_plan,
     live_claude_usage,
     live_codex_web_usage,
+    _classify_codex_windows,
     ClaudeWebError,
     CodexWebError,
     CodexAuthError,
@@ -457,6 +458,20 @@ def _fmt_reset_iso(iso, lang="zh"):
     except Exception:
         return "?"
 
+def _window_shorthand(window_minutes):
+    """按窗口实际分钟数生成 "5h"/"7d" 这类短标签，不假设 Codex 固定是 5h+7d 两档。
+
+    2026-07-13 起 OpenAI 后端把 Codex 的 5 小时窗口并入了周窗口——primary_window
+    的 limit_window_seconds 变成 604800（7 天），但字段位置仍叫 primary。之前这里
+    直接硬编码"primary=5h/secondary=7d"，导致周额度被贴上"5h"标签显示。
+    """
+    if not window_minutes:
+        return None
+    hours = window_minutes / 60
+    if hours < 24:
+        return f"{round(hours) or 1}h"
+    return f"{round(hours / 24)}d"
+
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
@@ -633,13 +648,19 @@ def _fetch_codex(lang):
     import socket, urllib.error
     try:
         _ts, rl = live_codex_web_usage()
-        primary   = rl.get("primary") or {}
-        secondary = rl.get("secondary") or {}
+        # 按窗口实际时长分类（≤6h 归"短档"，其余归"长档"），不按 primary/secondary
+        # 字段位置——2026-07-13 OpenAI 临时移除 5 小时限额后，唯一剩下的窗口出现在
+        # primary_window 字段里，但实际时长是 7 天。缺的那一档保留 None，交给渲染层
+        # 显示 "?" 占位，而不是隐藏整行：官方说明是"temporarily"，随时可能恢复，
+        # 隐藏/复现整行会让菜单栏布局跟着 OpenAI 开关这个限额忽隐忽现。
+        short_win, long_win = _classify_codex_windows(rl)
         return {
-            "5h_left":  int(round(100 - primary.get("used_percent", 0))),
-            "7d_left":  int(round(100 - secondary.get("used_percent", 0))),
-            "5h_reset": primary.get("resets_at"),
-            "7d_reset": secondary.get("resets_at"),
+            "5h_left":  int(round(100 - short_win.get("used_percent", 0))) if short_win else None,
+            "7d_left":  int(round(100 - long_win.get("used_percent", 0))) if long_win else None,
+            "5h_reset": short_win.get("resets_at") if short_win else None,
+            "7d_reset": long_win.get("resets_at") if long_win else None,
+            "5h_label": _window_shorthand(short_win.get("window_minutes")) if short_win else "5h",
+            "7d_label": _window_shorthand(long_win.get("window_minutes")) if long_win else "7d",
             "plan":     rl.get("plan_type") or "?",
         }
     except CodexAuthError:
@@ -957,7 +978,10 @@ def _detail_text(mode, pct, reset, lang):
     # U+2007 figure space = same pixel width as a digit; prevents tab-stop drift
     # when single-digit pct gets 2 ASCII spaces (narrower than 2 digits)
     fig = " "
-    pct_padded = str(pct).rjust(3, fig)
+    # pct=None：该档窗口这次没有数据（如被 OpenAI 临时移除），显示 "?" 占位，
+    # 不能 str(None) 变成字面 "None%"
+    pct_str = "?" if pct is None else str(pct)
+    pct_padded = pct_str.rjust(3, fig)
     if lang == "en":
         return f"  {mode}\t{pct_padded}% left   \t↻ {reset}"
     return f"  {mode}\t{pct_padded}% 剩余\t↻ {reset}"
@@ -1401,7 +1425,10 @@ class AiLimitApp(rumps.App):
                     bar_items.append(("CodeX", 0, True))
             elif codex:
                 pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
-                bar_items.append(("CodeX", pct, False))
+                if pct is None:  # 选中的窗口这次没数据（如 Codex 只返回一档额度），退到另一档
+                    pct = codex["7d_left"] if mode == "5h" else codex["5h_left"]
+                if pct is not None:
+                    bar_items.append(("CodeX", pct, False))
         try:
             _set_bar_with_batteries(self, bar_items, style)
         except Exception:
@@ -1451,10 +1478,16 @@ class AiLimitApp(rumps.App):
             elif codex:
                 plan = _fmt_plan(codex.get("plan"), lang)
                 _set_header_title(self._codex_header, f"CodeX{plan}", codex_status_info)
+                # 两档都固定显示；缺数据的那一档 pct=None/reset=None 会被
+                # _detail_text / _fmt_reset_epoch 渲染成 "?"，不隐藏整行——
+                # OpenAI 官方说 5 小时限额是"临时"移除，随时可能恢复，隐藏/
+                # 复现整行会让菜单栏布局跟着限额开关忽隐忽现。
+                self._codex_5h._menuitem.setHidden_(False)
+                self._codex_7d._menuitem.setHidden_(False)
                 x5_reset = _fmt_reset_epoch(codex["5h_reset"], lang)
                 x7_reset = _fmt_reset_epoch(codex["7d_reset"], lang)
-                self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)
-                self._codex_7d.title = _detail_text("7d", codex["7d_left"], x7_reset, lang)
+                self._codex_5h.title = _detail_text(codex.get("5h_label") or "5h", codex["5h_left"], x5_reset, lang)
+                self._codex_7d.title = _detail_text(codex.get("7d_label") or "7d", codex["7d_left"], x7_reset, lang)
 
         # 刷新时间：折进刷新频率子菜单标题（见 _update_rate_checks）
         self._last_refresh_str = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")

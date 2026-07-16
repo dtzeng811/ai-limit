@@ -22,16 +22,19 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "ai-limit.icns",
     "packages": ["rumps", "browser_cookie3", "Cryptodome"],
-    "includes": ["usage"],
+    "includes": ["usage", "panelui"],  # panelui = fork 版新增的面板绘制模块，显式声明确保打包
     "resources": ["ai-limit-updater.sh"],  # 一键更新 helper 脚本，随 App 一起签名封印
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示
         "CFBundleName": "AI Limit",
         "CFBundleDisplayName": "AI Limit",
         "CFBundleExecutable": "ai-limit",             # 保持可执行文件名/进程名稳定，不随显示名变化
-        "CFBundleIdentifier": "com.zhuchenxi.ai-limit",
+        # fork 版换掉 identifier，避免和官方版在 Launch Services / 登录项里
+        # 撞同一个身份（两者会互相覆盖注册）。CFBundleVersion 必须纯数字点分，
+        # 不能带 +fork 后缀（macOS 会拒绝），fork 标识放在 ShortVersionString。
+        "CFBundleIdentifier": "com.zhuchenxi.ai-limit.fork",
         "CFBundleVersion": "0.3.23",
-        "CFBundleShortVersionString": "0.3.23",
+        "CFBundleShortVersionString": "0.3.23-fork",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

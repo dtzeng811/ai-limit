@@ -12,3 +12,6 @@ RUNBOOK.md
 .agents/
 docs/reference/
 docs/adr/
+
+# 本地开发虚拟环境（fork 版新增）
+.venv/

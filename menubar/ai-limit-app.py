@@ -20,6 +20,8 @@ import webbrowser
 import rumps
 import AppKit
 
+import panelui
+
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
@@ -33,6 +35,8 @@ from usage import (
     CodexWebError,
     CodexAuthError,
     TZ_LOCAL,
+    WARN_THRESHOLD,
+    CRIT_THRESHOLD,
     epoch_to_local,
     fetch_status_components,
     worst_status,
@@ -67,8 +71,36 @@ _CACHE_TTL    = 55
 _HISTORY_RETENTION_SEC = 2 * 60 * 60
 _REFRESH_SEC  = 60               # 兜底默认（= 1 分钟）
 _REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
+
+# 抖动抑制：单次抓取失败不降级显示 ⚠️，沿用上一份好数据；连续失败达到
+# _FAIL_GRACE_N 次（或好数据老于 _STALE_MAX_SEC）才如实报错。
+# 依据是实测失败分布（2026-07 本机 2 小时）：claude/codex 的失败串绝大多数
+# 长度为 1（下一分钟即恢复）——Cloudflare 对非浏览器请求的 TLS 指纹校验会
+# 随机拦一下，属于环境固有抖动，README 也注明多会自行恢复。按监控惯例，
+# 单次探测失败不该报警；3 次连败（默认刷新率下 = 3 分钟）才算真故障。
+_FAIL_GRACE_N  = 3
+_STALE_MAX_SEC = 15 * 60
 _DISPLAY_MODES = ("5h", "7d")
-_BAR_STYLES    = ("both", "number", "battery")  # 菜单栏样式：数字+电池 / 仅数字 / 仅电池
+_BAR_STYLES    = ("both", "number", "ring")  # 菜单栏样式：环+数字 / 仅数字 / 仅环
+_BAR_STYLE_ALIASES = {"battery": "ring"}     # 迁移：v0.3.x 的电池样式 → 环
+
+# 菜单栏环形进度尺寸。14pt 跟 menuBarFont 的 cap 高度接近，排一行不突兀
+_RING_SIZE        = 14.0
+_RING_LINE_W      = 2.2
+_RING_TRACK_ALPHA = 0.28
+# 环用各家品牌色，两个环靠颜色区分服务——这比靠左右位置记「谁是谁」直观得多，
+# 也是不画「Claude」「CodeX」字样还能认出来的前提。
+# Claude = Anthropic 的陶土橙；CodeX = OpenAI 的青绿。两者在亮/暗菜单栏下都够醒目。
+_SERVICE_COLORS = {
+    "claude": "#D97757",
+    "codex":  "#10A37F",
+}
+# 告警不改环的颜色——环的颜色被品牌占用了，再拿它表告警会和「这是哪个服务」
+# 打架。改成让数字变色：环管识别，数字管警示，两个维度互不干扰。
+_NUM_ALERT_COLORS = {
+    "warn": AppKit.NSColor.systemYellowColor(),
+    "crit": AppKit.NSColor.systemRedColor(),
+}
 _LANGS         = ("zh", "en", "auto")
 _SERVICES      = ("claude", "codex")
 _MENU_MIN_WIDTH = 290
@@ -419,11 +451,18 @@ def _native_bar(pct, width=4):
     filled = round(max(0, min(100, pct)) / 100 * width)
     return "▰" * filled + "▱" * (width - filled)
 
-def _fmt_plan(plan, lang="zh"):
+def _plan_label(plan):
+    """面板卡片用的纯方案名（"Pro" / "Max 20x"）。不带"方案："前缀——
+    卡片里它紧跟在服务名后面当副标题，前缀是噪音。
+
+    不用 str.title()：它把紧跟数字的字母也当成词首，"max_20x" 会变成
+    "Max 20X"（Max 20x 用户实际会看到这个错别字）。只大写每个空格分词的
+    首字母。
+    """
     if not plan or plan == "?":
-        return ""
-    plan = str(plan).replace("_", " ").title()
-    return f" Plan: {plan}" if lang == "en" else f" 方案：{plan}"
+        return None
+    words = str(plan).replace("_", " ").split()
+    return " ".join(w[:1].upper() + w[1:] for w in words) or None
 
 def _fmt_reset_dt(dt, lang):
     today = datetime.datetime.now(TZ_LOCAL).date()
@@ -480,7 +519,7 @@ def _load_state():
     state = {"global": "5h", "lang": "auto",
              "bar_services": list(_SERVICES),    # 菜单栏图标显示哪些（不允许全空）
              "panel_services": list(_SERVICES),  # 详情面板显示哪些（允许全空）
-             "bar_style": "both",                # 菜单栏样式：both/number/battery
+             "bar_style": "both",                # 菜单栏样式：both/number/ring
              "refresh_min": 1,
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
@@ -507,8 +546,10 @@ def _load_state():
                 state["panel_services"] = [s for s in raw["panel_services"] if s in _SERVICES]
             elif legacy is not None:
                 state["panel_services"] = legacy
-            if raw.get("bar_style") in _BAR_STYLES:
-                state["bar_style"] = raw["bar_style"]
+            # 迁移：旧版的 "battery" 样式 → "ring"，别让老用户的选择被静默重置
+            bar_style = _BAR_STYLE_ALIASES.get(raw.get("bar_style"), raw.get("bar_style"))
+            if bar_style in _BAR_STYLES:
+                state["bar_style"] = bar_style
             if raw.get("refresh_min") in _REFRESH_MINS:
                 state["refresh_min"] = raw["refresh_min"]
             if isinstance(raw.get("claude_status_components"), list):
@@ -732,46 +773,68 @@ def _set_bar_title(app, text):
     app.title = text
 
 
-def _sf_battery_image(pct, point_size=14):
-    """返回对应百分比的 SF Symbol 电池 NSImage（5 档量化）。
+def _ring_level(pct):
+    """额度百分比 → 告警档位。沿用 CLI 的阈值语义，两边保持一致。"""
+    if pct < CRIT_THRESHOLD:
+        return "crit"
+    if pct < WARN_THRESHOLD:
+        return "warn"
+    return "ok"
 
-    粒度：0(<13) / 25 / 50 / 75 / 100(≥88)。
-    不在这里上色——会作为 template 一起整合进 composite，由 AppKit 在状态
-    栏上下文里和系统 Wi-Fi、电池等一起决定实际颜色（vibrancy/明暗自适应）。
+
+def _ring_image(pct, service, point_size=_RING_SIZE, line_width=_RING_LINE_W):
+    """画环形进度：底环 = 已用，实心弧 = 剩余，12 点起顺时针。
+
+    用品牌色实心绘制，不走 setTemplate_——template 会把整张图抹成系统前景色，
+    Claude 的橙和 CodeX 的青绿会双双变成同一个白/黑，那正好毁掉「一眼认出是
+    哪个服务」这个目的。代价是环不跟随菜单栏 vibrancy，但品牌识别更重要。
+
+    lockFocus 在 retina 上按 backing scale 出图，2x 下环线是干净的；这里
+    只画矢量弧，没有位图资源可糊。
     """
-    if pct >= 88:
-        name = "battery.100"
-    elif pct >= 63:
-        name = "battery.75"
-    elif pct >= 38:
-        name = "battery.50"
-    elif pct >= 13:
-        name = "battery.25"
-    else:
-        name = "battery.0"
-    img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
-    if img is None:
-        return None
-    cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-        point_size, AppKit.NSFontWeightMedium
+    size = float(point_size)
+    img = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(size, size))
+    img.lockFocus()
+    ctx = AppKit.NSGraphicsContext.currentContext()
+    ctx.setShouldAntialias_(True)
+
+    center = AppKit.NSMakePoint(size / 2, size / 2)
+    radius = (size - line_width) / 2
+    color = _nscolor_from_hex(_SERVICE_COLORS.get(service, "#888888"))
+
+    # 底环：走完整圈，剩余弧盖在上面
+    track = AppKit.NSBezierPath.bezierPath()
+    track.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_(
+        center, radius, 0, 360
     )
-    return img.imageWithSymbolConfiguration_(cfg)
+    track.setLineWidth_(line_width)
+    color.colorWithAlphaComponent_(_RING_TRACK_ALPHA).setStroke()
+    track.stroke()
+
+    p = max(0.0, min(100.0, float(pct)))
+    if p > 0:
+        arc = AppKit.NSBezierPath.bezierPath()
+        arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+            center, radius, 90.0, 90.0 - 360.0 * p / 100.0, True
+        )
+        arc.setLineWidth_(line_width)
+        arc.setLineCapStyle_(AppKit.NSLineCapStyleRound)
+        color.setStroke()
+        arc.stroke()
+
+    img.unlockFocus()
+    return img
 
 
-def _battery_attachment(pct, font):
-    """SF Symbol 电池包成 NSTextAttachment，可塞进 NSAttributedString 里跟文字一行排。
-
-    image 设 template，菜单栏会把它当系统图标处理（vibrancy + 亮暗自适应），
-    跟 Wi-Fi / 系统电池图标在同一渲染通道。
-    """
-    bat = _sf_battery_image(pct)
-    if bat is None:
+def _ring_attachment(pct, service, font):
+    """环包成 NSTextAttachment，塞进 NSAttributedString 跟数字排一行。"""
+    ring = _ring_image(pct, service)
+    if ring is None:
         return None
-    bat.setTemplate_(True)
     attach = AppKit.NSTextAttachment.alloc().init()
-    attach.setImage_(bat)
-    sz = bat.size()
-    # 垂直微调：让电池中线大致对齐文字中线
+    attach.setImage_(ring)
+    sz = ring.size()
+    # 垂直微调：环心对齐文字中线
     y_offset = (font.capHeight() - sz.height) / 2
     attach.setBounds_(AppKit.NSMakeRect(0, y_offset, sz.width, sz.height))
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
@@ -808,48 +871,64 @@ def _status_dot_attachment(status, font):
 
 def _render_attributed_title(items, style="both"):
     """构建状态栏 attributed title：文字交给 NSStatusBarButton 原生渲染（拿到
-    系统 vibrancy 和亮暗自适应），电池作为内联 template image 附件。
+    系统 vibrancy 和亮暗自适应），环作为内联 image 附件。
 
     旧方案是把整条画成位图（NSImage.lockFocus + labelColor），但 bitmap 里
     的文字是一次性栅格化的灰度，拿不到状态栏文字的 vibrancy，视觉上比系统
     时钟、菜单文字偏暗。
+
+    不画「Claude」「CodeX」服务名——那两个词占了整条一半宽度，是这个 App
+    在菜单栏里挤到要靠 Bartender 收纳的主因。服务靠位置区分（左 Claude、
+    右 CodeX），顺序恒定，看两天就形成肌肉记忆。出错那档退回带名字的 ⚠️，
+    因为报错必须说清是谁挂了。
     """
     font = AppKit.NSFont.menuBarFontOfSize_(0)
     text_attrs = {AppKit.NSFontAttributeName: font}
+    # 数字用等宽衬线数字：百分比每分钟在跳，比例字距会让整条宽度来回抖动
+    num_font = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+        font.pointSize(), AppKit.NSFontWeightRegular
+    )
     mas = AppKit.NSMutableAttributedString.alloc().init()
 
-    def append_text(s):
+    def append(s, attrs=text_attrs):
         mas.appendAttributedString_(
-            AppKit.NSAttributedString.alloc().initWithString_attributes_(s, text_attrs)
+            AppKit.NSAttributedString.alloc().initWithString_attributes_(s, attrs)
         )
 
-    for i, (label, pct, err) in enumerate(items):
-        prefix = "  " if i > 0 else ""
+    def num_attrs(pct):
+        """告警靠数字变色表达（环的颜色已经被品牌占用）。正常档不指定颜色，
+        让 NSStatusBarButton 用系统前景色渲染，保住 vibrancy 和亮暗自适应。"""
+        a = {AppKit.NSFontAttributeName: num_font}
+        alert = _NUM_ALERT_COLORS.get(_ring_level(pct))
+        if alert is not None:
+            a[AppKit.NSForegroundColorAttributeName] = alert
+        return a
+
+    for i, (svc, label, pct, err) in enumerate(items):
+        if i > 0:
+            append("  ")
         if err:
-            append_text(f"{prefix}{label} ⚠️")
+            append(f"{label} ⚠️")
             continue
         if style == "number":
-            append_text(f"{prefix}{label} {pct}%")
-        elif style == "battery":
-            append_text(f"{prefix}{label} ")
-            bat_attach = _battery_attachment(pct, font)
-            if bat_attach is not None:
-                mas.appendAttributedString_(bat_attach)
-        else:  # both：数字 + 电池
-            append_text(f"{prefix}{label} {pct}% ")
-            bat_attach = _battery_attachment(pct, font)
-            if bat_attach is not None:
-                mas.appendAttributedString_(bat_attach)
+            append(f"{pct}%", num_attrs(pct))
+            continue
+        ring = _ring_attachment(pct, svc, font)
+        if ring is not None:
+            mas.appendAttributedString_(ring)
+        if style != "ring":  # both：环 + 数字
+            append(" ")
+            append(f"{pct}%", num_attrs(pct))
 
     if mas.length() == 0:
         # 冷启动还没抓到数据：菜单栏不允许全空，故空列表只可能是加载态，
         # 显示中性「加载中」省略号，不要用 ⚠️（那是真·抓取失败的语义）
-        append_text("ai-limit…")
+        append("ai-limit…")
     return mas
 
 
-def _set_bar_with_batteries(app, items, style="both"):
-    """把 attributed title（文字 + 电池附件）安到状态栏按钮上。"""
+def _set_bar_rings(app, items, style="both"):
+    """把 attributed title（环附件 + 数字）安到状态栏按钮上。"""
     btn = _status_button(app)
     if btn is None:
         raise RuntimeError("no status button")
@@ -894,6 +973,19 @@ def _status_info(raw, selected, lang):
     return label, status
 
 
+def _panel_status_color(raw, selected):
+    """面板卡片右上角状态点的颜色（hex）。没得显示时返回 None。
+
+    跟 _status_info 同源同语义，只是面板不画"状态"两个字——卡片里那个点
+    紧贴服务名，位置本身就说明了它指的是服务健康度，不会跟额度百分比混淆。
+    """
+    if not selected or raw is None:
+        return None
+    result = None if raw == "unknown" else worst_status(raw, selected)
+    key = "unknown" if result is None else result[0]
+    return _STATUS_COLORS.get(key, _STATUS_COLORS["unknown"])
+
+
 def _set_header_title(menu_item, base_text, status_info):
     """父行标题：base_text 靠左正常渲染；status_info（若非空）用 attributed
     string 的右对齐 tab stop 贴到 _STATUS_RIGHT_TAB_X 这个固定坐标。
@@ -930,62 +1022,6 @@ def _set_header_title(menu_item, base_text, status_info):
     ns_item.setAttributedTitle_(attributed)
 
 
-_ERROR_ROW_MAX_WIDTH = 210.0
-# 异常态详情行（⚠️ 出现时）的安全像素宽度上限，必须小于 _MENU_MIN_WIDTH（290pt）。
-# NSMenu 没有 maximumWidth，宽度由"最宽的那一行菜单项"自适应撑出来；正常态的
-# _detail_text / _set_header_title 都靠固定 tab-stop/字符预算精心控制过，不会超；
-# 但异常态曾经只按字符数 [:60] 截断错误文案，跟真实渲染像素宽度无关——英文错误
-# 句（如 "No Codex access (subscription required or re-login needed)"）实际渲染
-# 宽度远超 290pt，导致面板在报错时明显变宽。
-#
-# 这个值不是"文字宽度"本身的安全上限，而是"文字宽度 + NSMenuItem 自身的图标/
-# 勾选栏/边距开销"之后仍要落在 290pt 内的预算——实测这部分开销约 58~60pt（同样的
-# 文字用 NSAttributedString 量出的宽度和最终 NSMenu 真实宽度对不上，差的就是这个
-# 开销）。第一版直接把 250pt 当成文字宽度上限，忽略了这部分开销，导致报错文案裁到
-# 250pt 时，整行实际还是把菜单撑到了 306~312pt——比正常态的 290pt 宽一截，用户截图
-# 实测能看出来（对比两张图左边缘对不齐）。这版改成 210pt 是实测二分找出来的安全值
-# （220pt 实测仍是 290pt，235pt 实测变成 293pt，超了）。改这个值前必须用真机截图或
-# `size of menu 1 of menu bar item` 直接量 NSMenu 真实宽度核对，不能只算文字宽度。
-
-def _fit_error_text(prefix, text, max_width=_ERROR_ROW_MAX_WIDTH):
-    """把异常态提示文案按真实像素宽度（而非字符数）裁尾并加省略号，
-    确保这一行绝不会比正常态更宽、撑大整个下拉菜单。"""
-    font = AppKit.NSFont.menuFontOfSize_(0)
-    attrs = {AppKit.NSFontAttributeName: font}
-
-    def _width(s):
-        return AppKit.NSAttributedString.alloc().initWithString_attributes_(
-            s, attrs
-        ).size().width
-
-    full = prefix + text
-    if _width(full) <= max_width:
-        return full
-    lo, hi = 0, len(text)
-    best = prefix + "…"
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = prefix + text[:mid].rstrip() + "…"
-        if _width(candidate) <= max_width:
-            best = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best
-
-
-def _detail_text(mode, pct, reset, lang):
-    # U+2007 figure space = same pixel width as a digit; prevents tab-stop drift
-    # when single-digit pct gets 2 ASCII spaces (narrower than 2 digits)
-    fig = " "
-    # pct=None：该档窗口这次没有数据（如被 OpenAI 临时移除），显示 "?" 占位，
-    # 不能 str(None) 变成字面 "None%"
-    pct_str = "?" if pct is None else str(pct)
-    pct_padded = pct_str.rjust(3, fig)
-    if lang == "en":
-        return f"  {mode}\t{pct_padded}% left   \t↻ {reset}"
-    return f"  {mode}\t{pct_padded}% 剩余\t↻ {reset}"
-
 # ── 主 App ────────────────────────────────────────────────────────────────────
 
 class AiLimitApp(rumps.App):
@@ -999,6 +1035,9 @@ class AiLimitApp(rumps.App):
         # 展示 unknown，不能沿用上一次的颜色（同额度数据不兜底旧值的原则）。
         self._claude_status_raw = None
         self._codex_status_raw  = None
+        # 抖动抑制的记账：每个服务的连续失败次数 + 最近一次成功的时刻
+        self._svc_fail    = {"claude": 0, "codex": 0}
+        self._svc_good_ts = {"claude": 0.0, "codex": 0.0}
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
@@ -1011,6 +1050,7 @@ class AiLimitApp(rumps.App):
         self._download_pending = None
         self._download_lock = threading.Lock()
         self._last_refresh_str = "…"   # 折进刷新频率子菜单标题，无单独菜单行
+        self._panel_view = None   # 详情面板视图，在 _build_menu 里建
         self._build_menu()
         # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
         # 不用 @rumps.timer 装饰器——那是静态绑定，改不了间隔。
@@ -1082,12 +1122,16 @@ class AiLimitApp(rumps.App):
     def _build_menu(self):
         lang = self._lang()
 
-        # Claude 区块（详情行挂 no-op callback 避免 macOS 自动灰化；段头改成子菜单
-        # 入口后不需要——挂了子菜单的 NSMenuItem 本身就不会被灰化，也不能再有
-        # 独立点击动作，跳转链接挪进子菜单第一行）
+        # 详情面板：整块自绘视图当菜单第一项。左键点菜单栏就弹出来（NSMenu
+        # 原生行为），额度数据全在这块画布上，不再占用菜单项。
+        self._panel_view = panelui.make_panel_view(panelui.panel_height([]))
+        self._panel_item = rumps.MenuItem("")
+        self._panel_item._menuitem.setView_(self._panel_view)
+
+        # Claude / CodeX 段头：改造后只是状态子菜单的入口（组件勾选），额度
+        # 数据搬去 popover 面板了。挂了子菜单的 NSMenuItem 不会被 macOS 灰化，
+        # 也不能再有独立点击动作，跳转链接在子菜单第一行。
         self._claude_header = rumps.MenuItem("Claude Code")
-        self._claude_5h     = _inert(rumps.MenuItem("  5h  …"))
-        self._claude_7d     = _inert(rumps.MenuItem("  7d  …"))
         self._claude_status_items = {}
         self._claude_status_open, self._claude_status_hint = self._build_status_submenu(
             self._claude_header, "claude", _CLAUDE_STATUS_ALL,
@@ -1095,8 +1139,6 @@ class AiLimitApp(rumps.App):
 
         # CodeX 区块
         self._codex_header = rumps.MenuItem("CodeX")
-        self._codex_5h     = _inert(rumps.MenuItem("  5h  …"))
-        self._codex_7d     = _inert(rumps.MenuItem("  7d  …"))
         self._codex_status_items = {}
         self._codex_status_open, self._codex_status_hint = self._build_status_submenu(
             self._codex_header, "codex", _CODEX_STATUS_ALL,
@@ -1135,7 +1177,7 @@ class AiLimitApp(rumps.App):
         self._bar_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_bar_codex)
         self._bar_style_both = rumps.MenuItem("", callback=self._make_set_bar_style("both"))
         self._bar_style_num  = rumps.MenuItem("", callback=self._make_set_bar_style("number"))
-        self._bar_style_bat  = rumps.MenuItem("", callback=self._make_set_bar_style("battery"))
+        self._bar_style_bat  = rumps.MenuItem("", callback=self._make_set_bar_style("ring"))
         self._bar_menu = rumps.MenuItem("")
         self._bar_menu.add(self._bar_claude)
         self._bar_menu.add(self._bar_codex)
@@ -1187,13 +1229,22 @@ class AiLimitApp(rumps.App):
         self._about_src    = _disable(rumps.MenuItem(
             "数据来源：本地日志 + 官方网页接口" if lang == "zh" else "Source: local logs + official web endpoints"
         ))
+        # 「检查更新」菜单项照常创建，但 fork 版故意不 add 进菜单——用户看不到、
+        # 点不到。为什么不彻底删掉这个对象：全代码有 7 处在语言切换/更新流程里
+        # 给它的 title 赋值，删了要连带清理那 7 处，容易漏一处就 AttributeError
+        # 崩。留着对象、只摘入口，改动最小也最安全。
+        #
+        # 为什么要摘：更新源指向原作者仓库（_RELEASES_API_URL =
+        # zhuchenxi113/ai-limit），上游一发新版，点它就会下载官方 DMG 覆盖掉
+        # 本地改造版，今天的 UI 改动全丢。要跟上游改用手动 `git fetch upstream`。
+        # 想恢复：把下面这行的注释解开重新 add 即可。
         self._check_update_item = rumps.MenuItem(
             "检查更新" if lang == "zh" else "Check for Updates",
             callback=self._check_for_updates,
         )
         self._about_menu.add(self._about_ver)
         self._about_menu.add(self._about_author)
-        self._about_menu.add(self._check_update_item)
+        # self._about_menu.add(self._check_update_item)  # fork 版禁用，见上
 
         # Star on GitHub（放在关于子菜单里，_about_menu 之后才 add）
         self._star_item = rumps.MenuItem(
@@ -1210,14 +1261,13 @@ class AiLimitApp(rumps.App):
             callback=rumps.quit_application,
         )
 
+        # 面板在最上面，下面是设置。两个服务段头只剩状态子菜单入口（组件勾选），
+        # 额度数据都画在面板里了。
         self.menu = [
-            self._claude_header,
-            self._claude_5h,
-            self._claude_7d,
+            self._panel_item,
             None,
+            self._claude_header,
             self._codex_header,
-            self._codex_5h,
-            self._codex_7d,
             None,
             self._rate_menu,
             self._refresh_item,
@@ -1256,9 +1306,97 @@ class AiLimitApp(rumps.App):
     #                → 把结果塞进 self._pending（加锁）
     #   主线程定时器 → _apply_pending 每 0.4s 检查 _pending，有就 apply + 重画
 
+    # ── 详情面板（菜单内嵌自绘视图）───────────────────────────────────────────
+    #
+    # 为什么是 NSMenuItem.setView_ 而不是 NSPopover：popover 在 rumps 里根本
+    # 弹不出来（showRelativeToRect 之后 isShown 恒为 False）。实测排除法——
+    # 裸 AppKit 同样代码能弹，套进 rumps 就不行；换自建 statusitem 也不行，
+    # 而普通 NSWindow 能正常显示，说明是 rumps 的 AppHelper.runEventLoop 事件
+    # 循环跟 NSPopover 不兼容，不是调用姿势的问题。
+    #
+    # setView_ 反而更贴需求：左键弹出是 NSMenu 的原生行为（不用自己接管点击、
+    # 不用分流左右键），设置项继续留在同一个菜单里，面板只是最上面那一项。
+
+    def _panel_payload(self):
+        """把额度数据组装成 panelui 的 payload。这里做全部业务判断和 i18n，
+        panelui 那边只管画。"""
+        lang = self._lang()
+        panel_svc = self._state.get("panel_services") or []
+        cards = []
+        for svc, data, title, raw_status, sel_key, sel_default, fmt_reset in (
+            ("claude", self._claude or {}, "Claude Code", self._claude_status_raw,
+             "claude_status_components", _CLAUDE_STATUS_DEFAULT, _fmt_reset_iso),
+            ("codex", self._codex or {}, "CodeX", self._codex_status_raw,
+             "codex_status_components", _CODEX_STATUS_DEFAULT, _fmt_reset_epoch),
+        ):
+            if svc not in panel_svc:
+                continue
+            sel = self._state.get(sel_key, sel_default)
+            card = {"title": title, "plan": None,
+                    "status_color": _panel_status_color(raw_status, sel),
+                    "brand": _SERVICE_COLORS.get(svc),
+                    "error": None, "rows": []}
+            if "error" in data:
+                # no_data = 还没读到（冷启动），不是真错误，显示中性文案
+                card["error"] = (_tr(lang, "读取中…", "Loading…")
+                                 if data["error"] == "no_data" else data["error"])
+            elif data:
+                card["plan"] = _plan_label(data.get("plan"))
+                for key, label_key, reset_key in (
+                    ("5h_left", "5h_label", "5h_reset"),
+                    ("7d_left", "7d_label", "7d_reset"),
+                ):
+                    pct = data.get(key)
+                    card["rows"].append({
+                        "label": data.get(label_key) or key[:2],
+                        "pct": pct,
+                        "level": _ring_level(pct) if pct is not None else None,
+                        "reset": fmt_reset(data.get(reset_key), lang) if data.get(reset_key) else None,
+                    })
+            else:
+                card["error"] = _tr(lang, "读取中…", "Loading…")
+            cards.append(card)
+
+        cur = self._state.get("refresh_min", 1)
+        footer = _tr(lang,
+                     f"{cur} 分钟刷新 · 上次 {self._last_refresh_str}",
+                     f"Every {cur} min · last {self._last_refresh_str}")
+        # 抖动抑制生效期间（在吸收失败、显示的是上一份好数据）在 footer 里
+        # 说明——用户看到的数字是旧值这件事必须可见，只是不用 ⚠️ 那么吵
+        retrying = [n for s, n in (("claude", "Claude"), ("codex", "CodeX"))
+                    if self._svc_fail.get(s, 0) > 0]
+        if retrying:
+            footer = _tr(lang,
+                         f"{'/'.join(retrying)} 重试中 · {footer}",
+                         f"{'/'.join(retrying)} retrying · {footer}")
+        return {
+            "cards": cards,
+            "footer": footer,
+            "empty": _tr(lang, "详情面板已关闭全部服务", "All services hidden from panel"),
+        }
+
+    def _render_panel(self):
+        """重画菜单里的面板视图。菜单项高度跟着 view 的 frame 走，所以卡片
+        数量变化（服务开关、报错）时要一并改 frame，否则会被裁掉或留空白。"""
+        if self._panel_view is None:
+            return
+        payload = self._panel_payload()
+        h = panelui.panel_height(payload["cards"])
+        self._panel_view.setFrameSize_(AppKit.NSMakeSize(panelui.PANEL_W, h))
+        self._panel_view.setPayload_(payload)
+
     @rumps.timer(0.3)
     def _init_render(self, sender):
-        """启动后立即用缓存重画 + 后台拉一次最新数据。"""
+        """启动后立即用缓存重画 + 后台拉一次最新数据。
+
+        sender.stop() 必须是第一句，不能放在函数末尾。这是个 0.3 秒的重复
+        timer，只靠 stop() 把自己变成一次性的；一旦下面任何一行抛异常，
+        stop() 就执行不到，它会以每秒 3 次的频率反复跑 _kick_background_fetch()。
+        实测踩过：尾部一处 TypeError → 43 秒内约 130 个请求打向 claude.ai
+        → 触发 Cloudflare 人机校验 → 之后持续 403。先 stop 再干活，最坏
+        情况只是初始化失败一次，不会演变成请求风暴。
+        """
+        sender.stop()
         self._refresh_from_cache()
         self._kick_background_fetch()
         self._check_update_failure_marker()
@@ -1267,7 +1405,6 @@ class AiLimitApp(rumps.App):
         # 是同一个开关、同一个含义——生产环境不会设置，行为不变。
         if os.environ.get("AI_LIMIT_AUTOTEST_SKIP_CONFIRM") == "1":
             self._check_for_updates(None)
-        sender.stop()
 
     def _check_update_failure_marker(self):
         """一键更新 helper 脚本失败时会写这个 marker 文件，启动时检查一次、
@@ -1314,10 +1451,8 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is not None:
             claude, codex, claude_status, codex_status = pending
-            if claude is not None:
-                self._claude = claude
-            if codex is not None:
-                self._codex = codex
+            self._claude = self._absorb_fetch("claude", claude, self._claude)
+            self._codex  = self._absorb_fetch("codex",  codex,  self._codex)
             # 状态字段同样遵守"None=没抓（服务禁用），不是清空"；但抓取失败时
             # usage.py 返回的是字符串 "unknown"（不是 None），照样会走进这里覆盖
             # 掉上一次的好值——失败必须显式变成 ❓，不能沿用旧颜色。
@@ -1370,14 +1505,44 @@ class AiLimitApp(rumps.App):
                         else _RELEASES_PAGE_URL)
             webbrowser.open(page_url)
 
+    def _absorb_fetch(self, svc, new, cur):
+        """抖动抑制：决定这次抓取结果要不要真的替换掉当前显示的数据。
+
+        - new 是 None（服务被禁用，这轮没抓）：沿用现值，保持原语义。
+        - 抓取成功：清零失败计数，记录成功时刻，正常替换。
+        - 抓取失败：失败计数 +1。若手里还有一份足够新的好数据、且连败还没到
+          _FAIL_GRACE_N，就继续显示旧的好数据——瞬时抖动（Cloudflare 随机拦一下、
+          SSL 握手超时）被吸收掉，菜单栏不闪 ⚠️。连败到阈值或数据过老才如实报错。
+        - 冷启动没有好数据可以沿用（cur 本身是错误/空）：立刻如实报错，
+          真问题（比如根本没登录）不能被吸收机制藏起来。
+        """
+        if new is None:
+            return cur
+        if "error" not in new:
+            self._svc_fail[svc] = 0
+            self._svc_good_ts[svc] = time.time()
+            return new
+        self._svc_fail[svc] += 1
+        has_good = bool(cur) and "error" not in cur
+        fresh = (time.time() - self._svc_good_ts.get(svc, 0.0)) <= _STALE_MAX_SEC
+        if has_good and fresh and self._svc_fail[svc] < _FAIL_GRACE_N:
+            return cur
+        return new
+
     def _refresh_from_cache(self):
         """主线程瞬时操作：读短缓存重画，不碰网络。"""
         claude, codex = _load_cache()
         # 不按 services 过滤——内存里保留两份数据，UI 显示由 _render 控
         if claude is not None:
             self._claude = claude
+            if "error" not in claude:
+                # 缓存里的好数据也算"最近成功过"（TTL 55s，足够新），这样启动后
+                # 第一次抓取就算失败，也能沿用缓存值而不是开机就闪 ⚠️
+                self._svc_good_ts["claude"] = time.time()
         if codex is not None:
             self._codex = codex
+            if "error" not in codex:
+                self._svc_good_ts["codex"] = time.time()
         self._render()
 
     def _kick_background_fetch(self):
@@ -1402,96 +1567,66 @@ class AiLimitApp(rumps.App):
         lang     = self._lang()
         mode     = self._state["global"]
         bar_svc   = self._state.get("bar_services") or list(_SERVICES)
-        panel_svc = self._state.get("panel_services") or []
         style     = self._state.get("bar_style", "both")
-        show_claude = "claude" in panel_svc   # 面板维度（下方区块沿用此变量）
-        show_codex  = "codex"  in panel_svc
         claude = self._claude or {}
         codex  = self._codex  or {}
 
-        # 菜单栏标题：[Claude 68% ⌬]  [CodeX 99% ⌬]
-        # 电池是原生 SF Symbol，Apple 亲手画的 iPhone 风格，向量永不糊
+        # 菜单栏标题：[◐ 58]  [◑ 99]。面板服务开关（panel_services）不影响这里，
+        # 它只管 popover 里画哪几张卡——见 _panel_payload
         bar_items = []
         if "claude" in bar_svc:
             if "error" in claude:
                 if claude["error"] != "no_data":   # no_data=还没读到数据,跳过(全跳过则落到兜底 ai-limit…);not_logged_in/异常才报 ⚠️
-                    bar_items.append(("Claude", 0, True))
+                    bar_items.append(("claude", "Claude", 0, True))
             elif claude:
                 pct = claude["5h_left"] if mode == "5h" else claude["7d_left"]
-                bar_items.append(("Claude", pct, False))
+                bar_items.append(("claude", "Claude", pct, False))
         if "codex" in bar_svc:
             if "error" in codex:
                 if codex["error"] != "no_data":   # 同上:no_data 跳过,not_logged_in/异常才报 ⚠️
-                    bar_items.append(("CodeX", 0, True))
+                    bar_items.append(("codex", "CodeX", 0, True))
             elif codex:
                 pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
                 if pct is None:  # 选中的窗口这次没数据（如 Codex 只返回一档额度），退到另一档
                     pct = codex["7d_left"] if mode == "5h" else codex["5h_left"]
                 if pct is not None:
-                    bar_items.append(("CodeX", pct, False))
+                    bar_items.append(("codex", "CodeX", pct, False))
         try:
-            _set_bar_with_batteries(self, bar_items, style)
+            _set_bar_rings(self, bar_items, style)
         except Exception:
-            # SF Symbol 不可用时（很老的 macOS）回退到 ▰▱ 文字版
+            # 环画不出来时（AppKit 绘图上下文异常）回退到 ▰▱ 文字版
             parts = []
-            for lbl, pct, err in bar_items:
+            for _svc, lbl, pct, err in bar_items:
                 if err:
                     parts.append(f"{lbl} ⚠️")
                 elif style == "number":
-                    parts.append(f"{lbl} {pct}%")
-                elif style == "battery":
-                    parts.append(f"{lbl} {_native_bar(pct)}")
+                    parts.append(f"{pct}%")
+                elif style == "ring":
+                    parts.append(_native_bar(pct))
                 else:
-                    parts.append(f"{lbl} {pct}% {_native_bar(pct)}")
+                    parts.append(f"{_native_bar(pct)} {pct}")
             _set_bar_title(self, "  ".join(parts) if parts else "ai-limit…")
 
-        # Claude 区块 —— 服务被关时整段隐藏
-        self._claude_header._menuitem.setHidden_(not show_claude)
-        self._claude_5h._menuitem.setHidden_(not show_claude)
-        self._claude_7d._menuitem.setHidden_(not show_claude)
-        claude_sel = self._state.get("claude_status_components", _CLAUDE_STATUS_DEFAULT)
-        claude_status_info = _status_info(self._claude_status_raw, claude_sel, lang)
-        if show_claude:
-            if "error" in claude:
-                _set_header_title(self._claude_header, "Claude Code ⚠️", claude_status_info)
-                self._claude_5h.title = _fit_error_text("  ", claude["error"])
-                self._claude_7d._menuitem.setHidden_(True)
-            elif claude:
-                plan = _fmt_plan(claude.get("plan"), lang)
-                _set_header_title(self._claude_header, f"Claude Code{plan}", claude_status_info)
-                c5_reset = _fmt_reset_iso(claude["5h_reset"], lang)
-                c7_reset = _fmt_reset_iso(claude["7d_reset"], lang)
-                self._claude_5h.title = _detail_text("5h", claude["5h_left"], c5_reset, lang)
-                self._claude_7d.title = _detail_text("7d", claude["7d_left"], c7_reset, lang)
-
-        # CodeX 区块
-        self._codex_header._menuitem.setHidden_(not show_codex)
-        self._codex_5h._menuitem.setHidden_(not show_codex)
-        self._codex_7d._menuitem.setHidden_(not show_codex)
-        codex_sel = self._state.get("codex_status_components", _CODEX_STATUS_DEFAULT)
-        codex_status_info = _status_info(self._codex_status_raw, codex_sel, lang)
-        if show_codex:
-            if "error" in codex:
-                _set_header_title(self._codex_header, "CodeX ⚠️", codex_status_info)
-                self._codex_5h.title = _fit_error_text("  ", codex["error"])
-                self._codex_7d._menuitem.setHidden_(True)
-            elif codex:
-                plan = _fmt_plan(codex.get("plan"), lang)
-                _set_header_title(self._codex_header, f"CodeX{plan}", codex_status_info)
-                # 两档都固定显示；缺数据的那一档 pct=None/reset=None 会被
-                # _detail_text / _fmt_reset_epoch 渲染成 "?"，不隐藏整行——
-                # OpenAI 官方说 5 小时限额是"临时"移除，随时可能恢复，隐藏/
-                # 复现整行会让菜单栏布局跟着限额开关忽隐忽现。
-                self._codex_5h._menuitem.setHidden_(False)
-                self._codex_7d._menuitem.setHidden_(False)
-                x5_reset = _fmt_reset_epoch(codex["5h_reset"], lang)
-                x7_reset = _fmt_reset_epoch(codex["7d_reset"], lang)
-                self._codex_5h.title = _detail_text(codex.get("5h_label") or "5h", codex["5h_left"], x5_reset, lang)
-                self._codex_7d.title = _detail_text(codex.get("7d_label") or "7d", codex["7d_left"], x7_reset, lang)
+        # 右键菜单里两个服务只剩状态子菜单入口，额度数据在面板里画。
+        # 标题保留 ⚠️ 和状态点：那是不点开也该看见的健康信号。
+        for header, data, name, raw_status, sel_key, sel_default in (
+            (self._claude_header, claude, "Claude Code", self._claude_status_raw,
+             "claude_status_components", _CLAUDE_STATUS_DEFAULT),
+            (self._codex_header, codex, "CodeX", self._codex_status_raw,
+             "codex_status_components", _CODEX_STATUS_DEFAULT),
+        ):
+            sel = self._state.get(sel_key, sel_default)
+            info = _status_info(raw_status, sel, lang)
+            broken = "error" in data and data["error"] != "no_data"
+            _set_header_title(header, f"{name} ⚠️" if broken else name, info)
 
         # 刷新时间：折进刷新频率子菜单标题（见 _update_rate_checks）
         self._last_refresh_str = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
         self._update_rate_checks()
+
+        # 面板重画。视图常驻在菜单里，菜单没打开时画了也不浪费——数据每分钟
+        # 才刷一次，重画一块 268x208 的静态卡片可以忽略不计。
+        self._render_panel()
 
     # ── 模式 / 语言切换 ──────────────────────────────────────────────────────
 
@@ -1685,9 +1820,9 @@ class AiLimitApp(rumps.App):
         self._bar_claude.title = ("✓ " if "claude" in bar else "  ") + "Claude Code"
         self._bar_codex.title  = ("✓ " if "codex"  in bar else "  ") + "CodeX"
         style = self._state.get("bar_style", "both")
-        self._bar_style_both.title = ("✓ " if style == "both"    else "  ") + _tr(lang, "数字 + 电池", "Number + battery")
+        self._bar_style_both.title = ("✓ " if style == "both"    else "  ") + _tr(lang, "环 + 数字", "Ring + number")
         self._bar_style_num.title  = ("✓ " if style == "number"  else "  ") + _tr(lang, "仅数字", "Number only")
-        self._bar_style_bat.title  = ("✓ " if style == "battery" else "  ") + _tr(lang, "仅电池", "Battery only")
+        self._bar_style_bat.title  = ("✓ " if style == "ring"    else "  ") + _tr(lang, "仅环", "Ring only")
         summary = _tr(lang, "全部", "All") if len(bar) == 2 else (
             "Claude Code" if "claude" in bar else "CodeX"
         )

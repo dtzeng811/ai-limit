@@ -463,6 +463,20 @@ def _single_instance_guard() -> bool:
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
+_LOG_PATH = pathlib.Path(os.environ.get("TEMP") or "/tmp") / "ai-limit-tray.log"
+
+
+def _log_exc(where: str):
+    """异常落盘。托盘 App 没有可见的 stderr（--noconsole 打包后更没有），
+    tkinter 回调异常默认只往 stderr 打——不落盘用户报障时什么线索都没有。"""
+    import traceback
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%F %T')}] {where}\n{traceback.format_exc()}")
+    except Exception:
+        pass
+
+
 def main():
     if not _single_instance_guard():
         print("ai-limit tray already running", file=sys.stderr)
@@ -485,6 +499,8 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
+    # tkinter 回调里的异常默认打 stderr 就没了，统一落盘（%TEMP%\ai-limit-tray.log）
+    root.report_callback_exception = lambda *a: _log_exc("tk-callback")
     flyout = Flyout(root, states, state)
 
     icons: dict[str, "pystray.Icon"] = {}
@@ -586,7 +602,10 @@ def main():
     # （与 macOS 版 AI_LIMIT_AUTOTEST_* 同一模式，生产不设置则无行为差异）
     if os.environ.get("AI_LIMIT_AUTOTEST_FLYOUT") == "1":
         def _autotest_loop():
-            flyout.show()
+            try:
+                flyout.show()
+            except Exception:
+                _log_exc("autotest-flyout")
             root.after(3000, _autotest_loop)
         root.after(3000, _autotest_loop)
     root.mainloop()

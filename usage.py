@@ -262,7 +262,7 @@ def _claude_web_context(referer: str) -> tuple[str, dict]:
 
     cookies = []
     errs = []
-    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+    for name, loader in [("Chrome", browser_cookie3.chrome), ("Edge", browser_cookie3.edge), ("Firefox", browser_cookie3.firefox)]:
         try:
             jar = loader(domain_name=".claude.ai")
             cookies = [(c.name, c.value) for c in jar]
@@ -682,7 +682,7 @@ def _load_chatgpt_cookies():
             "browser_cookie3 not installed, run: pip install browser-cookie3",
         ))
     errs = []
-    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+    for name, loader in [("Chrome", browser_cookie3.chrome), ("Edge", browser_cookie3.edge), ("Firefox", browser_cookie3.firefox)]:
         try:
             jar = loader(domain_name=".chatgpt.com")
             cookies = [(c.name, c.value) for c in jar]

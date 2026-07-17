@@ -1,0 +1,52 @@
+# 在 GitHub 的 Windows runner 上打包托盘版 exe。
+# 触发：手动（workflow_dispatch）或推 v* tag；tag 触发时自动把 exe 挂到对应 Release。
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # 往 Release 传附件需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          pip install -r winbar/requirements-win.txt pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --onefile --noconsole `
+            --name ai-limit-tray `
+            --distpath winbar/dist `
+            --workpath winbar/build `
+            --specpath winbar/build `
+            --add-data "${{ github.workspace }}\usage.py;." `
+            --hidden-import pystray._win32 `
+            winbar/ai-limit-tray.py
+
+      - name: Smoke import check
+        run: |
+          winbar/dist/ai-limit-tray.exe --help 2>$null; if ($LASTEXITCODE -ne 0) { echo "exe exists:"; Get-Item winbar/dist/ai-limit-tray.exe }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-limit-tray-windows
+          path: winbar/dist/ai-limit-tray.exe
+
+      - name: Attach to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" winbar/dist/ai-limit-tray.exe --clobber

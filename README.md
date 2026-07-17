@@ -1,6 +1,6 @@
 # ai-limit（改造版）
 
-macOS 菜单栏实时监控 **Claude Code** 和 **CodeX** 的剩余额度。
+实时监控 **Claude Code** 和 **CodeX** 的剩余额度。macOS 菜单栏 + Windows 系统托盘双端。
 
 本仓库是 [zhuchenxi113/ai-limit](https://github.com/zhuchenxi113/ai-limit) 的 fork，在上游 v0.3.23 基础上重造了整套菜单栏 UI，并加固了可靠性、大幅降低了请求量。按自己的使用需求持续迭代，不跟随上游自动更新，也不保证及时处理 issue / PR。
 
@@ -49,6 +49,30 @@ App 未签名公证，首次打开按系统版本二选一：
   <td><img src="docs/install-blocked-dialog.png" width="300" /></td>
   <td><img src="docs/install-open-anyway.png" width="440" /></td>
 </tr></table>
+
+## Windows 版（系统托盘）
+
+Windows 通知区域每个应用只有一个 16~32px 图标位，塞不下 macOS 菜单栏那种「环+数字」，所以按托盘规范重新设计：
+
+- **双托盘图标**：橙环 = Claude、青绿环 = CodeX（颜色与 macOS 版同一套品牌色），环的填充 = 剩余额度；额度告警时图标右下角出现黄/红徽标
+- **悬浮 tooltip**：精确百分比和重置时间
+- **左键**：弹出 flyout 卡片面板（对齐 Win11 电量/音量弹窗体验，深浅色跟随系统，失焦自动关）
+- **右键**：立即刷新 / 主显示窗口切换（5h/7d）/ 退出
+
+行为与 macOS 版一致：默认 3 分钟刷新 + 随机抖动、单次失败沿用旧数据（连败 3 次才报 ⚠）、连败指数退避。
+
+**安装**：从 [Releases](https://github.com/dtzeng811/ai-limit/releases/latest) 下载 `ai-limit-tray.exe` 直接运行（无需安装）。开机自启：`Win+R` 输入 `shell:startup`，把 exe 的快捷方式放进去。
+
+**从源码跑 / 自己打包**：
+
+```powershell
+git clone https://github.com/dtzeng811/ai-limit.git ; cd ai-limit
+pip install -r winbar\requirements-win.txt
+python winbar\ai-limit-tray.py                          # 直接运行
+powershell -ExecutionPolicy Bypass -File winbar\build-win.ps1   # 打包单文件 exe
+```
+
+**Windows 上的 cookie 读取**：走 `browser_cookie3`（Chrome/Edge 用 DPAPI，Firefox 直读 profile）。注意新版 Chrome/Edge 启用了 App-Bound Encryption，cookie 可能读不出来——此时用 **Firefox 登录** claude.ai / chatgpt.com 最稳。
 
 ## 从源码构建
 

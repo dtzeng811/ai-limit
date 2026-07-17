@@ -335,6 +335,7 @@ class Flyout:
         self.states = states
         self.state = state
         self.win = None
+        self._hide_job = None
 
     # 主题
     @staticmethod
@@ -369,8 +370,11 @@ class Flyout:
             self.win.attributes("-topmost", True)
             self.canvas = tk.Canvas(self.win, highlightthickness=0, bd=0)
             self.canvas.pack(fill="both", expand=True)
-            self.win.bind("<FocusOut>", lambda e: self.win.withdraw())
             self.win.bind("<Escape>", lambda e: self.win.withdraw())
+            # 不能在这里直接 bind FocusOut：Windows 禁止后台进程抢焦点，
+            # focus_force() 常常拿不到（或瞬间被收回）→ FocusOut 立即触发
+            # → 窗口弹出几毫秒就被自己收掉，肉眼只觉得"点了没反应"。
+            # FocusOut 延迟到确认真的拿到焦点后再武装（见 show() 尾部）。
 
         # 位置：贴近鼠标（= 托盘图标处），右下对齐并夹取到屏幕内
         mx, my = self.root.winfo_pointerx(), self.root.winfo_pointery()
@@ -400,6 +404,26 @@ class Flyout:
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
+
+        # 关闭时机（Windows flyout 惯例是点外面即关，但 tkinter 拿不到全局
+        # 鼠标钩子，用三重保底代替）：
+        # 1. 拿到焦点时：失焦即关（延迟武装，见上面 bind 处注释）
+        # 2. 拿不到焦点时：12 秒自动收起
+        # 3. 任何时候：再点托盘图标切换收起 / Esc
+        if self._hide_job is not None:
+            try:
+                self.root.after_cancel(self._hide_job)
+            except Exception:
+                pass
+        self._hide_job = self.root.after(12000, self.win.withdraw)
+
+        def _arm_focusout():
+            try:
+                if self.win.focus_displayof() is not None:
+                    self.win.bind("<FocusOut>", lambda e: self.win.withdraw())
+            except Exception:
+                pass
+        self.root.after(200, _arm_focusout)
 
     def _card(self, svc, st, mode, y0, card_bg, fg, sub, f_title, f_big, f_sub):
         c = self.canvas

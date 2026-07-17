@@ -581,6 +581,10 @@ def main():
         root.after(120, poll)
 
     root.after(120, poll)
+    # 仅测试用：无人值守环境点不了托盘，这个开关让 flyout 自己弹出来供截屏
+    # 验证（与 macOS 版 AI_LIMIT_AUTOTEST_* 同一模式，生产不设置则无行为差异）
+    if os.environ.get("AI_LIMIT_AUTOTEST_FLYOUT") == "1":
+        root.after(3000, flyout.show)
     root.mainloop()
     return 0
 

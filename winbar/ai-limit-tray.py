@@ -628,6 +628,13 @@ def main():
         def _autotest_loop():
             try:
                 flyout.show()
+                # 心跳探针：窗口到底映射没有、映射在哪、指针在哪——
+                # 无人值守排障的地面真相，比隔空猜测强
+                with open(_LOG_PATH, "a", encoding="utf-8") as f:
+                    w = flyout.win
+                    f.write(f"[{time.strftime('%T')}] hb state={w.state()} "
+                            f"geo={w.winfo_geometry()} viewable={w.winfo_viewable()} "
+                            f"ptr=({root.winfo_pointerx()},{root.winfo_pointery()})\n")
             except Exception:
                 _log_exc("autotest-flyout")
             root.after(3000, _autotest_loop)

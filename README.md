@@ -1,8 +1,8 @@
-# ai-limit（内部改造版）
+# ai-limit（改造版）
 
 macOS 菜单栏实时监控 **Claude Code** 和 **CodeX** 的剩余额度。
 
-本仓库是 [zhuchenxi113/ai-limit](https://github.com/zhuchenxi113/ai-limit) 的内部 fork，在上游 v0.3.23 基础上重造了整套菜单栏 UI，并加固了可靠性。内部持续迭代维护，不跟随上游自动更新。
+本仓库是 [zhuchenxi113/ai-limit](https://github.com/zhuchenxi113/ai-limit) 的 fork，在上游 v0.3.23 基础上重造了整套菜单栏 UI，并加固了可靠性、大幅降低了请求量。按自己的使用需求持续迭代，不跟随上游自动更新，也不保证及时处理 issue / PR。
 
 ## 菜单栏
 
@@ -36,7 +36,7 @@ macOS 菜单栏实时监控 **Claude Code** 和 **CodeX** 的剩余额度。
 
 ## 安装
 
-从 [Releases](https://github.com/dtzeng811/ai-limit/releases) 下载最新 DMG（需要本仓库访问权限），双击挂载后把 **AI Limit.app** 拖进 Applications。
+从 [Releases](https://github.com/dtzeng811/ai-limit/releases/latest) 下载最新 DMG，双击挂载后把 **AI Limit.app** 拖进 Applications。
 
 App 未签名公证，首次打开按系统版本二选一：
 

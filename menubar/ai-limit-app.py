@@ -74,6 +74,7 @@ _REFRESH_SEC  = 180              # 兜底默认（= 3 分钟）
 _REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
 _DEFAULT_REFRESH_MIN = 3         # 默认 3 分钟：5h/7d 额度窗口以小时计，1 分钟粒度
                                  # 没有信息增量，却把请求量放大 3 倍（风控画像考量）
+_LEGACY_REFRESH_MIN  = 1         # fork.1 及更早的默认值，用于一次性迁移（见 _load_state）
 # 每轮后台抓取前加 0..N 秒随机延迟：精确 60.0s 节拍是自动化行为画像里最典型
 # 的特征之一（人类不会毫秒级准时），抖动让请求时刻不可预测。只延迟自动刷新，
 # 手动"立即刷新"不加（用户在等结果）。
@@ -532,6 +533,10 @@ def _load_state():
              "panel_services": list(_SERVICES),  # 详情面板显示哪些（允许全空）
              "bar_style": "both",                # 菜单栏样式：both/number/ring
              "refresh_min": _DEFAULT_REFRESH_MIN,
+             # 全新安装天然就是新默认，不需要迁移——标记必须在默认值里就为 True，
+             # 否则新用户主动选 1 分钟后，下次启动会被迁移逻辑误判成"老用户遗留值"
+             # 而抬回 3 分钟（用户显式选择被覆盖）
+             "refresh_min_migrated": True,
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
     try:
@@ -561,8 +566,16 @@ def _load_state():
             bar_style = _BAR_STYLE_ALIASES.get(raw.get("bar_style"), raw.get("bar_style"))
             if bar_style in _BAR_STYLES:
                 state["bar_style"] = bar_style
-            if raw.get("refresh_min") in _REFRESH_MINS:
-                state["refresh_min"] = raw["refresh_min"]
+            # 一次性迁移：fork.1 及更早的默认是 1 分钟，绝大多数人从没动过这个
+            # 设置——直接沿用会让升级用户拿不到本版最大的一项收益（刷新频率是
+            # 请求量的 3 倍因子）。只把恰好等于旧默认值的情况抬到新默认，其它
+            # 值（2/4/5）都是用户显式选过的，原样保留。迁移后立刻写回 state，
+            # 保证只抬这一次——用户之后若主动选回 1 分钟，不会被反复覆盖。
+            saved_min = raw.get("refresh_min")
+            if saved_min == _LEGACY_REFRESH_MIN and not raw.get("refresh_min_migrated"):
+                state["refresh_min"] = _DEFAULT_REFRESH_MIN   # 抬到新默认
+            elif saved_min in _REFRESH_MINS:
+                state["refresh_min"] = saved_min              # 用户显式选择，原样保留
             if isinstance(raw.get("claude_status_components"), list):
                 state["claude_status_components"] = [
                     c for c in raw["claude_status_components"] if c in _CLAUDE_STATUS_ALL]

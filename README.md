@@ -61,7 +61,14 @@ Windows 通知区域每个应用只有一个 16~32px 图标位，塞不下 macOS
 
 行为与 macOS 版一致：默认 3 分钟刷新 + 随机抖动、单次失败沿用旧数据（连败 3 次才报 ⚠）、连败指数退避。
 
-**安装**：从 [Releases](https://github.com/dtzeng811/ai-limit/releases/latest) 下载 `ai-limit-tray.exe` 直接运行（无需安装）。开机自启：`Win+R` 输入 `shell:startup`，把 exe 的快捷方式放进去。
+<table><tr>
+  <td><img src="docs/screenshot-windows-tray.png" width="320" /></td>
+  <td><img src="docs/screenshot-windows-flyout.png" width="300" /></td>
+</tr></table>
+
+*实测截图（Windows 11 虚拟机，未登录浏览器，故显示错误徽标与报错卡片——这正是错误态的设计样式）*
+
+**安装**：从 [Releases](https://github.com/dtzeng811/ai-limit/releases/latest) 下载 `ai-limit-tray.exe` 直接运行（无需安装）。开机自启：`Win+R` 输入 `shell:startup`，把 exe 的快捷方式放进去。新装的托盘图标默认收在 `^` 溢出区，拖到任务栏即可常显。
 
 **从源码跑 / 自己打包**：
 

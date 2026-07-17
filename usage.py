@@ -742,6 +742,38 @@ def _get_chatgpt_access_token(cookie_header: str, timeout: int) -> str:
     return token
 
 
+# access token 进程内缓存。/api/auth/session 是鉴权端点，风控权重远高于普通
+# 只读接口；而 token 的有效期（JWT exp）远长于刷新间隔，每轮刷新都重新换一个
+# token 是不必要的高频鉴权信号（默认频率下 = 1440 次/天）。缓存后降到个位数。
+# 只存内存、不落盘：菜单栏 App 是常驻进程，收益最大；CLI 单次运行无收益但无害。
+_CHATGPT_TOKEN_CACHE = {"token": None, "exp": 0.0}
+_TOKEN_EXP_MARGIN_SEC = 120   # 到期前 2 分钟就当过期，避免边界上撞 401
+
+
+def _jwt_exp(token: str) -> float:
+    """尽力解析 JWT payload 里的 exp（Unix 秒）；解析不出返回 0，调用方用兜底 TTL。"""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0))
+    except Exception:
+        return 0.0
+
+
+def _cached_chatgpt_token(cookie_header: str, timeout: int,
+                          force_refresh: bool = False) -> tuple[str, bool]:
+    """返回 (token, from_cache)。from_cache=True 时调用方撞到 401/403 应
+    force_refresh 重试一次再下结论——缓存 token 可能刚好被服务端吊销。"""
+    now = time.time()
+    c = _CHATGPT_TOKEN_CACHE
+    if not force_refresh and c["token"] and now < c["exp"] - _TOKEN_EXP_MARGIN_SEC:
+        return c["token"], True
+    token = _get_chatgpt_access_token(cookie_header, timeout)
+    c["token"] = token
+    c["exp"] = _jwt_exp(token) or (now + 10 * 60)   # 解析不出 exp 就保守给 10 分钟
+    return token, False
+
+
 def _normalize_web_rate_limits(data: dict) -> dict:
     rl = data.get("rate_limit") or {}
 
@@ -780,25 +812,34 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     import urllib.error
     cookies = _load_chatgpt_cookies()
     cookie_header = "; ".join(f"{n}={v}" for n, v in cookies)
-    token = _get_chatgpt_access_token(cookie_header, timeout)
-    req = urllib.request.Request(
-        "https://chatgpt.com/backend-api/codex/usage",
-        headers=_chatgpt_headers(cookie_header, bearer=token),
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read()
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            raise CodexAuthError(
-                t(
-                    f"HTTP {e.code}：未登录 ChatGPT 或无 Codex 权限（可能未订阅，或需重新登录）",
-                    f"HTTP {e.code}: not signed in to ChatGPT or no Codex access (subscription may be required)",
+    token, from_cache = _cached_chatgpt_token(cookie_header, timeout)
+    body = None
+    for attempt in range(2):
+        req = urllib.request.Request(
+            "https://chatgpt.com/backend-api/codex/usage",
+            headers=_chatgpt_headers(cookie_header, bearer=token),
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                # 缓存 token 可能刚被服务端吊销：强刷换新 token 重试一次，
+                # 仍失败才判定为真·无权限。新换的 token 失败则不重试。
+                if from_cache and attempt == 0:
+                    token, from_cache = _cached_chatgpt_token(
+                        cookie_header, timeout, force_refresh=True)
+                    continue
+                raise CodexAuthError(
+                    t(
+                        f"HTTP {e.code}：未登录 ChatGPT 或无 Codex 权限（可能未订阅，或需重新登录）",
+                        f"HTTP {e.code}: not signed in to ChatGPT or no Codex access (subscription may be required)",
+                    )
                 )
-            )
-        raise CodexWebError(f"HTTP {e.code}")
-    except Exception as e:
-        raise CodexWebError(str(e))
+            raise CodexWebError(f"HTTP {e.code}")
+        except Exception as e:
+            raise CodexWebError(str(e))
     try:
         data = json.loads(body)
     except json.JSONDecodeError:

@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import pathlib
+import random
 import re
 import shutil
 import subprocess
@@ -69,17 +70,27 @@ _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
 _HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 _CACHE_TTL    = 55
 _HISTORY_RETENTION_SEC = 2 * 60 * 60
-_REFRESH_SEC  = 60               # 兜底默认（= 1 分钟）
+_REFRESH_SEC  = 180              # 兜底默认（= 3 分钟）
 _REFRESH_MINS = (1, 2, 3, 4, 5)  # 用户可选的刷新频率（分钟）
+_DEFAULT_REFRESH_MIN = 3         # 默认 3 分钟：5h/7d 额度窗口以小时计，1 分钟粒度
+                                 # 没有信息增量，却把请求量放大 3 倍（风控画像考量）
+# 每轮后台抓取前加 0..N 秒随机延迟：精确 60.0s 节拍是自动化行为画像里最典型
+# 的特征之一（人类不会毫秒级准时），抖动让请求时刻不可预测。只延迟自动刷新，
+# 手动"立即刷新"不加（用户在等结果）。
+_JITTER_MAX_SEC = 20
 
 # 抖动抑制：单次抓取失败不降级显示 ⚠️，沿用上一份好数据；连续失败达到
 # _FAIL_GRACE_N 次（或好数据老于 _STALE_MAX_SEC）才如实报错。
 # 依据是实测失败分布（2026-07 本机 2 小时）：claude/codex 的失败串绝大多数
 # 长度为 1（下一分钟即恢复）——Cloudflare 对非浏览器请求的 TLS 指纹校验会
 # 随机拦一下，属于环境固有抖动，README 也注明多会自行恢复。按监控惯例，
-# 单次探测失败不该报警；3 次连败（默认刷新率下 = 3 分钟）才算真故障。
+# 单次探测失败不该报警；3 次连败（默认 3 分钟刷新率下 = 9 分钟）才算真故障。
 _FAIL_GRACE_N  = 3
 _STALE_MAX_SEC = 15 * 60
+# 指数退避：连败达到 _FAIL_GRACE_N 后不再按原频率硬撞——收到 403/Cloudflare
+# 挑战还持续原样请求，在风控看来是最恶劣的自动化模式，会累积负面信号。
+# 连败 N 次后跳过 2^(N-3) 个刷新周期再试，上限 30 分钟。手动"立即刷新"清零。
+_BACKOFF_MAX_SEC = 30 * 60
 _DISPLAY_MODES = ("5h", "7d")
 _BAR_STYLES    = ("both", "number", "ring")  # 菜单栏样式：环+数字 / 仅数字 / 仅环
 _BAR_STYLE_ALIASES = {"battery": "ring"}     # 迁移：v0.3.x 的电池样式 → 环
@@ -520,7 +531,7 @@ def _load_state():
              "bar_services": list(_SERVICES),    # 菜单栏图标显示哪些（不允许全空）
              "panel_services": list(_SERVICES),  # 详情面板显示哪些（允许全空）
              "bar_style": "both",                # 菜单栏样式：both/number/ring
-             "refresh_min": 1,
+             "refresh_min": _DEFAULT_REFRESH_MIN,
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
     try:
@@ -650,16 +661,34 @@ def _append_history(claude, codex):
 
 # ── 数据获取 ─────────────────────────────────────────────────────────────────
 
+# Claude 套餐名进程内缓存：套餐几个月才变一次，之前每轮刷新都跟着 usage 一起
+# 查一次 organizations/{org}，等于把打向 claude.ai 的请求量白白翻倍。缓存 12 小时，
+# 查失败时沿用旧值（套餐名只是展示信息，宁可旧也不必重试制造请求）。
+_PLAN_CACHE = {"plan": None, "ts": 0.0}
+_PLAN_TTL_SEC = 12 * 60 * 60
+
+
+def _cached_claude_plan():
+    now = time.time()
+    if now - _PLAN_CACHE["ts"] < _PLAN_TTL_SEC:
+        return _PLAN_CACHE["plan"]
+    try:
+        plan = live_claude_plan()
+        _PLAN_CACHE["plan"] = plan
+        _PLAN_CACHE["ts"] = now
+        return plan
+    except Exception:
+        # 失败不清缓存也不刷新时间戳：下一轮到点再试，期间沿用旧值
+        return _PLAN_CACHE["plan"]
+
+
 def _fetch_claude(lang):
     import socket, urllib.error
     try:
         data = live_claude_usage()
         five_h = data.get("five_hour") or {}
         seven_d = data.get("seven_day") or {}
-        try:
-            plan = live_claude_plan()
-        except Exception:
-            plan = None
+        plan = _cached_claude_plan()
         return {
             "5h_left":  int(round(100 - float(five_h.get("utilization", 0)))),
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
@@ -1038,6 +1067,8 @@ class AiLimitApp(rumps.App):
         # 抖动抑制的记账：每个服务的连续失败次数 + 最近一次成功的时刻
         self._svc_fail    = {"claude": 0, "codex": 0}
         self._svc_good_ts = {"claude": 0.0, "codex": 0.0}
+        # 指数退避：连败超过宽限次数后，该时刻之前不再对该服务发请求
+        self._svc_backoff_until = {"claude": 0.0, "codex": 0.0}
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
@@ -1058,7 +1089,7 @@ class AiLimitApp(rumps.App):
         self._auto_timer.start()
 
     def _refresh_sec(self):
-        return self._state.get("refresh_min", 1) * 60
+        return self._state.get("refresh_min", _DEFAULT_REFRESH_MIN) * 60
 
     def _lang(self):
         """当前生效语言：菜单里选了"中文"/"English"就用该选择（持久化覆盖），
@@ -1435,8 +1466,9 @@ class AiLimitApp(rumps.App):
         )
 
     def _auto_refresh(self, _):
-        """按用户选择的频率后台拉一次（由 self._auto_timer 驱动，间隔可调）。"""
-        self._kick_background_fetch()
+        """按用户选择的频率后台拉一次（由 self._auto_timer 驱动，间隔可调）。
+        自动刷新带随机抖动；手动"立即刷新"不带（用户在等结果）。"""
+        self._kick_background_fetch(jitter=True)
 
     @rumps.timer(0.4)
     def _apply_pending(self, _):
@@ -1521,8 +1553,16 @@ class AiLimitApp(rumps.App):
         if "error" not in new:
             self._svc_fail[svc] = 0
             self._svc_good_ts[svc] = time.time()
+            self._svc_backoff_until[svc] = 0.0
             return new
         self._svc_fail[svc] += 1
+        # 连败达到宽限次数后进入指数退避：跳过 1、2、4、8… 个刷新周期，
+        # 上限 _BACKOFF_MAX_SEC。持续被 Cloudflare 拦时不再按原频率硬撞，
+        # 给拦截热度降温的窗口，也避免在风控画像里累积"拦不住"的负面信号。
+        over = self._svc_fail[svc] - _FAIL_GRACE_N
+        if over >= 0:
+            delay = min(self._refresh_sec() * (2 ** over), _BACKOFF_MAX_SEC)
+            self._svc_backoff_until[svc] = time.time() + delay
         has_good = bool(cur) and "error" not in cur
         fresh = (time.time() - self._svc_good_ts.get(svc, 0.0)) <= _STALE_MAX_SEC
         if has_good and fresh and self._svc_fail[svc] < _FAIL_GRACE_N:
@@ -1545,15 +1585,24 @@ class AiLimitApp(rumps.App):
                 self._svc_good_ts["codex"] = time.time()
         self._render()
 
-    def _kick_background_fetch(self):
+    def _kick_background_fetch(self, jitter=False):
         """启动后台线程抓数据；线程内不要碰任何 UI 对象。"""
-        t = threading.Thread(target=self._async_refresh, daemon=True)
+        t = threading.Thread(target=self._async_refresh, args=(jitter,), daemon=True)
         t.start()
 
-    def _async_refresh(self):
+    def _async_refresh(self, jitter=False):
         """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
+        if jitter:
+            # 打破精确节拍：sleep 在后台线程里，不阻塞 UI。
+            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
         lang = self._lang()
+        now = time.time()
         need = set(self._state.get("bar_services") or []) | set(self._state.get("panel_services") or [])
+        # 指数退避中的服务这一轮跳过（None = 没拉新的，UI 沿用现值）
+        if now < self._svc_backoff_until.get("claude", 0.0):
+            need.discard("claude")
+        if now < self._svc_backoff_until.get("codex", 0.0):
+            need.discard("codex")
         claude = _fetch_claude(lang) if "claude" in need else None
         codex  = _fetch_codex(lang)  if "codex"  in need else None
         # 组件状态：拉全量列表，不按用户勾选过滤——过滤放渲染层，这样用户在
@@ -1670,7 +1719,7 @@ class AiLimitApp(rumps.App):
 
     def _update_rate_checks(self):
         lang = self._lang()
-        cur = self._state.get("refresh_min", 1)
+        cur = self._state.get("refresh_min", _DEFAULT_REFRESH_MIN)
         for m, it in self._rate_items.items():
             it.title = ("✓ " if m == cur else "  ") + _tr(lang, f"{m} 分钟", f"{m} min")
         ts = self._last_refresh_str
@@ -1848,6 +1897,8 @@ class AiLimitApp(rumps.App):
             _CACHE_PATH.unlink()
         except Exception:
             pass
+        # 用户显式要求刷新：清掉指数退避，立即发（不加抖动，用户在等结果）
+        self._svc_backoff_until = {"claude": 0.0, "codex": 0.0}
         # 后台拉，不卡 UI；新数据 ≤几秒内通过 _apply_pending 落到菜单上
         self._kick_background_fetch()
 

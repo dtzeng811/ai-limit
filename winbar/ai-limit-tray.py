@@ -624,7 +624,9 @@ def main():
     # 仅测试用：无人值守环境点不了托盘，这个开关让 flyout 每 3 秒自动弹出
     # 供截屏验证——失焦自动收起的行为会让单次弹出在抓屏前消失，所以是循环弹
     # （与 macOS 版 AI_LIMIT_AUTOTEST_* 同一模式，生产不设置则无行为差异）
-    if os.environ.get("AI_LIMIT_AUTOTEST_FLYOUT") == "1":
+    # strip()：cmd 的 `set X=1 && ...` 会把 && 前的空格算进值（"1 "），
+    # 不 strip 的话计划任务/批处理里设的开关会静默失效
+    if os.environ.get("AI_LIMIT_AUTOTEST_FLYOUT", "").strip() == "1":
         def _autotest_loop():
             try:
                 flyout.show()

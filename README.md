@@ -88,14 +88,12 @@ Windows 通知区域每个应用只有一个 16~32px 图标位，塞不下 macOS
 
 第三个托盘图标是 **IP 安全盾牌**（见上文），左键直接跳转检测站点：
 
-![Windows 三图标](docs/screenshot-windows-tray-ip.png)
-
 <table><tr>
-  <td><img src="docs/screenshot-windows-tray.png" width="320" /></td>
-  <td><img src="docs/screenshot-windows-flyout.png" width="300" /></td>
+  <td><img src="docs/screenshot-windows-tray-ip.png" width="330" /></td>
+  <td><img src="docs/screenshot-windows-flyout.png" width="290" /></td>
 </tr></table>
 
-*实测截图（Windows 11 虚拟机，未登录浏览器，故显示错误徽标与报错卡片——这正是错误态的设计样式）*
+*实测截图（Windows 11 虚拟机）。左图三个托盘图标：Claude 环、CodeX 环、IP 安全盾牌；两个环带红色徽标是因为该虚拟机浏览器未登录，这正是错误态的样式。*
 
 **安装**：从 [Releases](https://github.com/dtzeng811/ai-limit/releases/latest) 下载 `ai-limit-tray.exe` 直接运行（无需安装）。开机自启：`Win+R` 输入 `shell:startup`，把 exe 的快捷方式放进去。新装的托盘图标默认收在 `^` 溢出区，拖到任务栏即可常显。
 

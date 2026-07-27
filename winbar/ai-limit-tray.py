@@ -143,6 +143,138 @@ def save_state(state: dict) -> None:
         pass
 
 
+# ── 开机自启（对应 Mac 版的 LaunchAgent plist） ───────────────────────────────
+# 走 HKCU\...\Run 而不是「启动」文件夹的快捷方式：快捷方式要 COM/pywin32 才能
+# 生成，为一个开关引入原生依赖不值当；winreg 是标准库，且 HKCU 不需要管理员权限。
+_RUN_KEY_PATH   = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_VALUE_NAME = "ai-limit-tray"
+
+# 源码运行时要拼进命令行的脚本路径。在模块级取而不是在函数里现取：PyInstaller
+# 打包后 __file__ 指向 _MEIPASS 临时解包目录（每次启动都不一样），只有源码运行
+# 这条分支会用到它，模块级固化下来也方便单测替换。
+_SCRIPT_PATH = pathlib.Path(__file__).resolve()
+
+
+def _winreg_or_none():
+    """非 Windows 上 `import winreg` 直接 ImportError。集中在这一处降级，
+    下面每个函数拿到 None 就走「查询=未开启、设置=静默无操作」，这样开发机
+    （macOS）上加载本模块跑离线单测不会炸。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        return winreg
+    except ImportError:
+        return None
+
+
+def _pythonw_path() -> str:
+    """源码运行时用来起进程的解释器。
+
+    必须是 pythonw.exe 而不是 python.exe：后者带控制台子系统，开机自启会在
+    桌面上弹一个黑窗口，一个常驻托盘 App 不该有这种可见副作用。同目录换名
+    即可（venv / 系统 Python 的布局都是 python.exe 与 pythonw.exe 并排）；
+    换不出来（比如某些精简发行版没带 pythonw）就退回原解释器——宁可弹个黑窗，
+    也好过开机根本起不来。
+    """
+    exe = pathlib.Path(sys.executable)
+    cand = exe.with_name("pythonw.exe")
+    return str(cand if cand.exists() else exe)
+
+
+def autostart_command() -> str:
+    """Run 键该写的值 = 开机时执行的命令行。
+
+    路径一律套双引号：默认安装位置 `C:\\Program Files\\...` 带空格，不加引号
+    时 Windows 会把第一个空格前的片段当作可执行文件名，开机静默启动失败，
+    而且失败得毫无痕迹——这是这个功能最容易踩的坑。
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{_pythonw_path()}" "{_SCRIPT_PATH}"'
+
+
+def autostart_enabled() -> bool:
+    """勾选状态**每次都实时读注册表**，不落 ~/.ai-limit-winbar.json。
+
+    因为这个开关有 App 之外的入口：任务管理器「启动」页、msconfig、各种优化
+    软件都能把它关掉。本地状态文件一旦和注册表不一致，菜单就会长期说谎，而
+    注册表本身就是唯一权威——那再存一份就纯属自找麻烦。
+    """
+    winreg = _winreg_or_none()
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH) as key:
+            value, _type = winreg.QueryValueEx(key, _RUN_VALUE_NAME)
+        return bool(value)
+    except Exception:
+        # 值不存在（FileNotFoundError）是最常见的一支，等同于「没开」；
+        # 组策略禁读之类的 OSError 也只能当没开，不能让菜单构造抛异常
+        return False
+
+
+def set_autostart(enabled: bool) -> bool:
+    """写入 / 删除 Run 值。返回是否真的达成目标（供自愈和单测断言用）。
+
+    注册表可能被组策略或安全软件锁死，写失败在企业环境里是常态。托盘 App
+    没有可靠的弹窗位置，失败就静默返回 False：菜单下次展开时读到的仍是「关」，
+    用户看得见结果，也不会因为一个开关把整个 App 崩掉。
+    """
+    winreg = _winreg_or_none()
+    if winreg is None:
+        return False
+    try:
+        if enabled:
+            # CreateKeyEx 而不是 OpenKey：Run 键在极少数精简 / 全新用户配置里
+            # 确实不存在。access 显式给 KEY_WRITE 而不用 CreateKey 的默认
+            # KEY_ALL_ACCESS——只是写个值，没必要申请这个键的全部权限
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0,
+                                    winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, _RUN_VALUE_NAME, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0,
+                                    winreg.KEY_SET_VALUE) as key:
+                    winreg.DeleteValue(key, _RUN_VALUE_NAME)
+            except FileNotFoundError:
+                pass          # 键或值本来就不存在 = 已经是"关"，算达成而不是失败
+        return True
+    except Exception:
+        return False
+
+
+def toggle_autostart() -> bool:
+    """菜单点击的入口：以注册表当前值为基准取反。"""
+    return set_autostart(not autostart_enabled())
+
+
+def sync_autostart_path() -> bool:
+    """启动时的路径漂移自愈：值还在但指向的不是当前可执行路径，就地改写。
+
+    为什么必须做：用户把 exe 从下载目录挪进 Program Files、覆盖安装到新的版本
+    目录、或者换了盘符之后，Run 键里留的还是旧路径。菜单读到「值存在」照样打
+    勾显示已开启，可开机时那条路径已经不在了 → 静默不启动。用户看不到任何报错，
+    也不会想到去翻注册表，只会认为这个功能坏了。App 自己每次启动都知道真实路径，
+    顺手校正一次是成本最低的修复点。
+
+    只在**已开启**（值存在）时改写：值不存在说明用户没开或主动关过，绝不能因为
+    跑了一次就被偷偷加上开机自启。
+    """
+    winreg = _winreg_or_none()
+    if winreg is None:
+        return False
+    want = autostart_command()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH) as key:
+            current, _type = winreg.QueryValueEx(key, _RUN_VALUE_NAME)
+    except Exception:
+        return False
+    if str(current) == want:
+        return False
+    return set_autostart(True)
+
+
 # ── 额度档位 / 抖动抑制 / 指数退避（与 Mac 版同语义） ─────────────────────────
 def level_of(pct) -> str:
     if pct is None:
@@ -930,6 +1062,9 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(2)  # flyout 防糊
         except Exception:
             pass
+    # 每次启动校正一次 Run 键里的路径（挪过 exe / 覆盖安装后它会指向旧位置，
+    # 详见 sync_autostart_path 的注释）。函数内部已经吞掉全部异常，不再包一层
+    sync_autostart_path()
 
     import pystray
     import tkinter as tk
@@ -1030,8 +1165,19 @@ def main():
         wake_evt.set()
         ui_queue.put("quit")
 
+    def on_autostart(icon, item):
+        # 写失败（组策略锁注册表）只返回 False，不弹窗也不抛：托盘回调里抛异常
+        # 会被 pystray 吞掉或打死消息循环，而勾选状态下次展开菜单自会照实反映
+        toggle_autostart()
+
     def mode_checked(m):
         return lambda item: state["mode"] == m
+
+    # checked 每次展开菜单都会被调用一次 → 直接读注册表，所以外部改动（任务
+    # 管理器「启动」页）能立刻反映在勾选上，不需要 App 自己维护一份状态
+    def autostart_item():
+        return pystray.MenuItem(tr("开机自启", "Launch at login"), on_autostart,
+                                checked=lambda item: autostart_enabled())
 
     menu = pystray.Menu(
         pystray.MenuItem(tr("详情", "Details"), on_flyout, default=True),
@@ -1042,15 +1188,19 @@ def main():
         pystray.MenuItem(tr("主显示 7 天", "Primary window 7d"),
                          make_mode_setter("7d"), radio=True, checked=mode_checked("7d")),
         pystray.Menu.SEPARATOR,
+        autostart_item(),
         pystray.MenuItem(tr("退出", "Quit"), on_quit),
     )
 
     # 盾牌的默认动作是直接跳转，不弹 flyout：面板给不出 WebRTC 的答案，
     # 网页才是完整检测，中间插一层面板只是多一次点击
+    # 开机自启在两个菜单里都放一份（各自 new 一个 MenuItem，不共用实例）：用户
+    # 常常只让其中一个图标常显、另一个折进溢出区，只放一边等于一半用户找不到
     shield_menu = pystray.Menu(
         pystray.MenuItem(tr("在网页中检测", "Check in browser"), on_ip_open, default=True),
         pystray.MenuItem(tr("立即刷新", "Refresh now"), on_ip_refresh),
         pystray.Menu.SEPARATOR,
+        autostart_item(),
         pystray.MenuItem(tr("退出", "Quit"), on_quit),
     )
 

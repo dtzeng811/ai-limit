@@ -46,6 +46,7 @@ from usage import (
     CLAUDE_STATUS_PAGE_URL,
     CODEX_STATUS_PAGE_URL,
 )
+import ipsec
 
 
 def _detect_system_lang() -> str:
@@ -116,6 +117,33 @@ _NUM_ALERT_COLORS = {
 _LANGS         = ("zh", "en", "auto")
 _SERVICES      = ("claude", "codex")
 _MENU_MIN_WIDTH = 290
+
+# ── IP 安全度 ────────────────────────────────────────────────────────────────
+# 10 分钟一轮，不跟额度共用 3 分钟节拍：出口 IP / DNS 出口不会分钟级变化，
+# 按额度频率去测只是白白增加对 claude.ai 和 ip.net.coffee 的请求量。
+_IPSEC_REFRESH_SEC = 10 * 60
+_IPSEC_FAIL_GRACE  = 3       # 连败到这个次数盾牌才变灰（同额度的 _FAIL_GRACE_N 哲学）
+_SHIELD_SIZE   = _RING_SIZE  # 跟环同高，菜单栏一行里三个图标视觉等重
+_SHIELD_GAP    = 4.0         # 盾牌左侧留白，跟 CodeX 的数字分开
+_SHIELD_LINE_W = 1.3         # 轮廓
+_SHIELD_MARK_W = 1.6         # 内部符号：比轮廓略粗，小尺寸下才认得出形状
+# 四档的语义色。灰是"没测到"，不是"测到问题"——红留给真问题。
+_SHIELD_COLORS = {
+    ipsec.SHIELD_OK:   AppKit.NSColor.systemGreenColor(),
+    ipsec.SHIELD_WARN: AppKit.NSColor.systemYellowColor(),
+    ipsec.SHIELD_CRIT: AppKit.NSColor.systemRedColor(),
+    ipsec.SHIELD_IDLE: AppKit.NSColor.tertiaryLabelColor(),
+}
+# 绘图彻底失败时的纯文字兜底（同额度的 ▰▱ 兜底），形状语义尽量对得上
+_SHIELD_GLYPHS = {
+    ipsec.SHIELD_OK: "✓", ipsec.SHIELD_WARN: "–",
+    ipsec.SHIELD_CRIT: "!", ipsec.SHIELD_IDLE: "·",
+}
+# 面板卡片右上角状态点复用 Statuspage 那套配色，不再新造一份 hex
+_SHIELD_STATUS_KEY = {
+    ipsec.SHIELD_OK: "operational", ipsec.SHIELD_WARN: "degraded_performance",
+    ipsec.SHIELD_CRIT: "major_outage", ipsec.SHIELD_IDLE: "unknown",
+}
 
 # 服务状态监控：可勾选的组件（Statuspage 官方组件名，原样用于抓取匹配）。
 # Claude Code / App+CLI+Codex API 是默认勾选——覆盖 ai-limit 本身采集用量数据的入口；
@@ -476,6 +504,90 @@ def _plan_label(plan):
     words = str(plan).replace("_", " ").split()
     return " ".join(w[:1].upper() + w[1:] for w in words) or None
 
+def _abuse_score_label(raw):
+    """abuser_score 原始形如 "0.0039 (Low)"，只取括号里的档位。
+
+    四位小数对用户没有任何决策价值，却会把「风险」那一行撑到需要截断，
+    把真正有用的标签（机房 IP / VPN）挤掉。
+    """
+    if not raw:
+        return None
+    m = re.search(r"\(([^)]+)\)", str(raw))
+    return (m.group(1) if m else str(raw)).strip() or None
+
+
+def _ip_card_rows(data, lang):
+    """把 ipsec.probe() 的扁平结果翻成 panelui 的四行 parts。
+
+    判定和 i18n 都在这里做，panelui 只管画（跟额度卡片同一条分工）。
+    """
+    rows = []
+
+    # 出口 IP：地点用 trace 的两位国家码（US）而不是 iprisk 的全称
+    # （United States），一行里塞不下全称，且缩写与城市名并列更好扫读
+    parts = [{"t": "text", "s": data.get("ip") or "?", "mono": True}]
+    place = " · ".join(x for x in (data.get("loc") or data.get("country"),
+                                   data.get("city")) if x)
+    if place:
+        parts.append({"t": "text", "s": place, "dim": True})
+    rows.append({"label": _tr(lang, "出口 IP", "Exit IP"), "parts": parts})
+
+    # 风险：命中的标记按严重度从高到低排，「机房 IP」是中性事实不是告警
+    # （用户长期走机房出口，标黄只会让告警失效——见设计文档判定表）
+    if data.get("degraded"):
+        parts = [{"t": "text", "s": _tr(lang, "不可用", "Unavailable"), "dim": True}]
+    else:
+        parts = []
+        for flag, zh, en, tone in (
+            ("is_abuser",     "滥用 IP", "Abuser",     "crit"),
+            ("is_tor",        "Tor",     "Tor",        "crit"),
+            ("is_proxy",      "代理",    "Proxy",      "warn"),
+            ("is_vpn",        "VPN",     "VPN",        "warn"),
+            ("is_datacenter", "机房 IP", "Datacenter", None),
+        ):
+            if data.get(flag):
+                parts.append({"t": "tag", "s": _tr(lang, zh, en), "tone": tone})
+        if not parts:
+            parts.append({"t": "tag", "s": _tr(lang, "无标记", "No flags"), "tone": "ok"})
+        score = _abuse_score_label(data.get("abuser_score"))
+        if score:
+            parts.append({"t": "text",
+                          "s": _tr(lang, f"滥用分 {score}", f"Abuse {score}"),
+                          "dim": True})
+    rows.append({"label": _tr(lang, "风险", "Risk"), "parts": parts})
+
+    # DNS：dns_ok=False 是"这轮没测成"，跟"测了但没有出口"（=加密/走代理，
+    # 安全）是两回事，不能都画成安全
+    if not data.get("dns_ok"):
+        parts = [{"t": "text", "s": _tr(lang, "不可用", "Unavailable"), "dim": True}]
+    elif data.get("dns_leaked"):
+        where = ", ".join(sorted({
+            str(s.get("country") or s.get("country_name") or "?")
+            for s in data.get("dns_servers") or []
+        }))
+        parts = [{"t": "text", "s": _tr(lang, f"出口在 {where}", f"Exits in {where}")},
+                 {"t": "tag", "s": _tr(lang, "泄露", "Leaked"), "tone": "crit"}]
+    elif data.get("dns_servers"):
+        n = len(data["dns_servers"])
+        parts = [{"t": "text", "s": _tr(lang, f"{n} 个出口 · 同国",
+                                        f"{n} exits · same country"), "dim": True},
+                 {"t": "tag", "s": _tr(lang, "安全", "Safe"), "tone": "ok"}]
+    else:
+        parts = [{"t": "text", "s": _tr(lang, "未暴露出口（加密）",
+                                        "No exit exposed"), "dim": True},
+                 {"t": "tag", "s": _tr(lang, "安全", "Safe"), "tone": "ok"}]
+    rows.append({"label": "DNS", "parts": parts})
+
+    # WebRTC：纯 HTTP 客户端测不了（要浏览器建 RTCPeerConnection 收 ICE
+    # candidate）。如实写"需浏览器检测"，不伪装成已检测——这一行同时是引导
+    # 用户点开网页的钩子
+    rows.append({"label": "WebRTC", "parts": [
+        {"t": "text", "s": _tr(lang, "需浏览器检测", "Browser check needed"), "dim": True},
+        {"t": "text", "s": "→", "dim": True},
+    ]})
+    return rows
+
+
 def _fmt_reset_dt(dt, lang):
     today = datetime.datetime.now(TZ_LOCAL).date()
     target = dt.date()
@@ -537,6 +649,8 @@ def _load_state():
              # 否则新用户主动选 1 分钟后，下次启动会被迁移逻辑误判成"老用户遗留值"
              # 而抬回 3 分钟（用户显式选择被覆盖）
              "refresh_min_migrated": True,
+             # IP 安全度：关掉时面板卡片和菜单栏盾牌一起消失（也就不再发检测请求）
+             "ip_security": True,
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
     try:
@@ -576,6 +690,8 @@ def _load_state():
                 state["refresh_min"] = _DEFAULT_REFRESH_MIN   # 抬到新默认
             elif saved_min in _REFRESH_MINS:
                 state["refresh_min"] = saved_min              # 用户显式选择，原样保留
+            if isinstance(raw.get("ip_security"), bool):
+                state["ip_security"] = raw["ip_security"]
             if isinstance(raw.get("claude_status_components"), list):
                 state["claude_status_components"] = [
                     c for c in raw["claude_status_components"] if c in _CLAUDE_STATUS_ALL]
@@ -882,6 +998,86 @@ def _ring_attachment(pct, service, font):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
 
 
+def _shield_image(level, point_size=_SHIELD_SIZE, gap=_SHIELD_GAP):
+    """画 IP 安全盾牌：轮廓 + 内部符号。
+
+    四档靠**形状**区分（勾 / 横线 / 感叹号 / 圆点），颜色只是加强：菜单栏
+    14pt 下颜色差异本来就细，色觉障碍用户更是只剩形状可依——只换颜色不换
+    形状等于对一部分人完全不可读。
+
+    左侧留 gap 宽的透明边当间距。为什么不在 attributed string 里插空格：
+    空格宽度随菜单栏字体变，画进图里的留白才是恒定的 4pt。
+
+    同 _ring_image，不 setTemplate_——template 图在 NSStatusBarButton 的文本
+    附件里不渲染，还会把这里靠颜色区分的四档抹成同一个前景色。
+    """
+    s = float(point_size)
+    img = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(s + gap, s))
+    img.lockFocus()
+    AppKit.NSGraphicsContext.currentContext().setShouldAntialias_(True)
+    color = _SHIELD_COLORS.get(level, _SHIELD_COLORS[ipsec.SHIELD_IDLE])
+    color.setStroke()
+    color.setFill()
+
+    def p(fx, fy):
+        return AppKit.NSMakePoint(gap + fx * s, fy * s)
+
+    def dot(center, r):
+        AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+            AppKit.NSMakeRect(center.x - r, center.y - r, r * 2, r * 2)).fill()
+
+    # 平顶盾牌：上沿平直、两侧下收成尖底。坐标是 0~1 的比例，改尺寸不用重调
+    outline = AppKit.NSBezierPath.bezierPath()
+    outline.moveToPoint_(p(0.10, 0.88))
+    outline.lineToPoint_(p(0.90, 0.88))
+    outline.lineToPoint_(p(0.90, 0.46))
+    outline.curveToPoint_controlPoint1_controlPoint2_(
+        p(0.50, 0.07), p(0.90, 0.25), p(0.72, 0.14))
+    outline.curveToPoint_controlPoint1_controlPoint2_(
+        p(0.10, 0.46), p(0.28, 0.14), p(0.10, 0.25))
+    outline.closePath()
+    outline.setLineWidth_(_SHIELD_LINE_W)
+    outline.setLineJoinStyle_(AppKit.NSLineJoinStyleRound)
+    outline.stroke()
+
+    mark = AppKit.NSBezierPath.bezierPath()
+    mark.setLineWidth_(_SHIELD_MARK_W)
+    mark.setLineCapStyle_(AppKit.NSLineCapStyleRound)
+    mark.setLineJoinStyle_(AppKit.NSLineJoinStyleRound)
+    if level == ipsec.SHIELD_OK:
+        mark.moveToPoint_(p(0.29, 0.56))
+        mark.lineToPoint_(p(0.44, 0.41))
+        mark.lineToPoint_(p(0.72, 0.70))
+        mark.stroke()
+    elif level == ipsec.SHIELD_WARN:
+        mark.moveToPoint_(p(0.30, 0.54))
+        mark.lineToPoint_(p(0.70, 0.54))
+        mark.stroke()
+    elif level == ipsec.SHIELD_CRIT:
+        mark.moveToPoint_(p(0.50, 0.75))
+        mark.lineToPoint_(p(0.50, 0.51))
+        mark.stroke()
+        dot(p(0.50, 0.38), 0.075 * s)
+    else:
+        dot(p(0.50, 0.53), 0.13 * s)
+
+    img.unlockFocus()
+    return img
+
+
+def _shield_attachment(level, font):
+    """盾牌包成 NSTextAttachment，跟环和数字排同一行。"""
+    img = _shield_image(level)
+    if img is None:
+        return None
+    attach = AppKit.NSTextAttachment.alloc().init()
+    attach.setImage_(img)
+    sz = img.size()
+    y_offset = (font.capHeight() - sz.height) / 2
+    attach.setBounds_(AppKit.NSMakeRect(0, y_offset, sz.width, sz.height))
+    return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
+
+
 def _nscolor_from_hex(hex_color):
     raw = hex_color.lstrip("#")
     try:
@@ -911,7 +1107,7 @@ def _status_dot_attachment(status, font):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attach)
 
 
-def _render_attributed_title(items, style="both"):
+def _render_attributed_title(items, style="both", shield=None):
     """构建状态栏 attributed title：文字交给 NSStatusBarButton 原生渲染（拿到
     系统 vibrancy 和亮暗自适应），环作为内联 image 附件。
 
@@ -962,21 +1158,28 @@ def _render_attributed_title(items, style="both"):
             append(" ")
             append(f"{pct}%", num_attrs(pct))
 
-    if mas.length() == 0:
+    if mas.length() == 0 and not shield:
         # 冷启动还没抓到数据：菜单栏不允许全空，故空列表只可能是加载态，
         # 显示中性「加载中」省略号，不要用 ⚠️（那是真·抓取失败的语义）
         append("ai-limit…")
+
+    # 盾牌排在最后（CodeX 数字之后）：额度是每天要瞄好几眼的主信息，IP 安全
+    # 是"平时绿着就不用管"的守卫信息，放末尾不抢主信息的读取顺序。
+    if shield:
+        sh = _shield_attachment(shield, font)
+        if sh is not None:
+            mas.appendAttributedString_(sh)
     return mas
 
 
-def _set_bar_rings(app, items, style="both"):
-    """把 attributed title（环附件 + 数字）安到状态栏按钮上。"""
+def _set_bar_rings(app, items, style="both", shield=None):
+    """把 attributed title（环附件 + 数字 + 盾牌附件）安到状态栏按钮上。"""
     btn = _status_button(app)
     if btn is None:
         raise RuntimeError("no status button")
     btn.setImage_(None)
     btn.setTitle_("")
-    btn.setAttributedTitle_(_render_attributed_title(items, style))
+    btn.setAttributedTitle_(_render_attributed_title(items, style, shield))
 
 def _noop(_):
     """无副作用 callback，仅用于让 macOS 把无动作菜单项也按常规文字色渲染。
@@ -1085,6 +1288,12 @@ class AiLimitApp(rumps.App):
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
+        # IP 安全度：跟额度分开走一条 10 分钟的慢节奏链路，互不牵连
+        # （额度进指数退避时不该顺带停掉 IP 检测，反之亦然）
+        self._ipsec = None          # 最近一次成功的检测结果
+        self._ipsec_fail = 0        # 连续失败次数，到 _IPSEC_FAIL_GRACE 才变灰
+        self._ip_pending = None
+        self._ip_lock = threading.Lock()
         # 检查更新：同样模式，后台线程查完放这里，_apply_pending 接力弹窗
         self._update_checking = False
         self._update_pending = None
@@ -1100,6 +1309,9 @@ class AiLimitApp(rumps.App):
         # 不用 @rumps.timer 装饰器——那是静态绑定，改不了间隔。
         self._auto_timer = rumps.Timer(self._auto_refresh, self._refresh_sec())
         self._auto_timer.start()
+        # IP 检测独立定时器：频率固定 10 分钟，不跟随用户选的额度刷新频率
+        self._ip_timer = rumps.Timer(self._auto_ip_refresh, _IPSEC_REFRESH_SEC)
+        self._ip_timer.start()
 
     def _refresh_sec(self):
         return self._state.get("refresh_min", _DEFAULT_REFRESH_MIN) * 60
@@ -1169,6 +1381,7 @@ class AiLimitApp(rumps.App):
         # 详情面板：整块自绘视图当菜单第一项。左键点菜单栏就弹出来（NSMenu
         # 原生行为），额度数据全在这块画布上，不再占用菜单项。
         self._panel_view = panelui.make_panel_view(panelui.panel_height([]))
+        self._panel_view.set_ip_click(self._open_ip_site)
         self._panel_item = rumps.MenuItem("")
         self._panel_item._menuitem.setView_(self._panel_view)
 
@@ -1233,9 +1446,11 @@ class AiLimitApp(rumps.App):
         # 详情面板子菜单：显示哪些服务（允许全空，只看菜单栏）
         self._panel_claude = rumps.MenuItem("Claude Code", callback=self._toggle_panel_claude)
         self._panel_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_panel_codex)
+        self._panel_ipsec  = rumps.MenuItem("",            callback=self._toggle_panel_ipsec)
         self._panel_menu = rumps.MenuItem("")
         self._panel_menu.add(self._panel_claude)
         self._panel_menu.add(self._panel_codex)
+        self._panel_menu.add(self._panel_ipsec)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -1401,6 +1616,9 @@ class AiLimitApp(rumps.App):
                 card["error"] = _tr(lang, "读取中…", "Loading…")
             cards.append(card)
 
+        if self._state.get("ip_security", True):
+            cards.append(self._ip_card(lang))
+
         cur = self._state.get("refresh_min", 1)
         footer = _tr(lang,
                      f"{cur} 分钟刷新 · 上次 {self._last_refresh_str}",
@@ -1418,6 +1636,85 @@ class AiLimitApp(rumps.App):
             "footer": footer,
             "empty": _tr(lang, "详情面板已关闭全部服务", "All services hidden from panel"),
         }
+
+    # ── IP 安全度 ────────────────────────────────────────────────────────────
+
+    def _shield_level(self):
+        """菜单栏盾牌 / 卡片状态点的档位。
+
+        连败到宽限次数、或还没测出过任何结果，一律 idle（灰）——灰表示"没测到"，
+        跟 crit（红，测到了问题）是两个不同的事实，混用会让红灯天天因为网络
+        抖动亮起，用户很快就不看了。
+        """
+        if self._ipsec_fail >= _IPSEC_FAIL_GRACE or not self._ipsec:
+            return ipsec.SHIELD_IDLE
+        return self._ipsec.get("level") or ipsec.SHIELD_IDLE
+
+    def _open_ip_site(self):
+        webbrowser.open(ipsec.SITE_URL)
+
+    def _ip_card(self, lang):
+        level = self._shield_level()
+        card = {
+            "kind": "ip",
+            "icon": "shield",   # 卡头画个小盾牌，跟菜单栏那个图标对得上
+            "title": _tr(lang, "IP 安全", "IP Security"),
+            "hint": _tr(lang, "在网页中检测 ↗", "Check in browser ↗"),
+            "status_color": _STATUS_COLORS[_SHIELD_STATUS_KEY.get(level, "unknown")],
+            "error": None,
+            "rows": [],
+        }
+        if self._ipsec_fail >= _IPSEC_FAIL_GRACE:
+            card["error"] = _tr(lang,
+                                f"检测不可用（连续 {self._ipsec_fail} 次失败）",
+                                f"Check unavailable ({self._ipsec_fail} failures in a row)")
+        elif not self._ipsec:
+            card["error"] = _tr(lang, "检测中…", "Checking…")
+        else:
+            card["rows"] = _ip_card_rows(self._ipsec, lang)
+        return card
+
+    def _absorb_ipsec(self, new):
+        """盾牌的抖动抑制，跟 _absorb_fetch 同一套哲学，但失败的落点不同：
+        额度抓取失败会显式报 ⚠️，IP 检测失败只把盾牌置**灰**。
+
+        也因此不直接采信 probe() 在 claude.ai 不可达时给出的 crit——本机视角
+        分不清"Claude 挂了"和"我断网了"，一律按"没测到"处理：前两次沿用上次
+        结果（盾牌不动），第三次起变灰。
+        """
+        if new is None:
+            return
+        if new.get("error"):
+            self._ipsec_fail += 1
+            return
+        self._ipsec_fail = 0
+        self._ipsec = new
+
+    def _auto_ip_refresh(self, _):
+        self._kick_ip_fetch(jitter=True)
+
+    def _kick_ip_fetch(self, jitter=False):
+        """启动后台线程跑一轮 IP 检测；关掉这个功能时一个请求都不发。"""
+        if not self._state.get("ip_security", True):
+            return
+        threading.Thread(target=self._async_ip_refresh, args=(jitter,),
+                         daemon=True).start()
+
+    def _async_ip_refresh(self, jitter=False):
+        """后台线程：跑 ipsec.probe()。同额度抓取，线程内不能碰任何 UI 对象。
+
+        probe() 内部已经吞掉了各探针的异常，这里再兜一层是防它自己抛（比如
+        socket 模块层面的异常）——后台线程未捕获异常会静默吃掉这一轮结果，
+        _ip_pending 永远拿不到值，盾牌就永久停在"检测中"。
+        """
+        if jitter:
+            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+        try:
+            result = ipsec.probe()
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+        with self._ip_lock:
+            self._ip_pending = result
 
     def _render_panel(self):
         """重画菜单里的面板视图。菜单项高度跟着 view 的 frame 走，所以卡片
@@ -1443,6 +1740,7 @@ class AiLimitApp(rumps.App):
         sender.stop()
         self._refresh_from_cache()
         self._kick_background_fetch()
+        self._kick_ip_fetch()
         self._check_update_failure_marker()
         # 仅测试用：Stage 3 端到端联调没有人工点"检查更新"菜单项的手段，
         # 用同一个 autotest 环境变量在启动后自动触发一次，和上面跳过确认弹窗
@@ -1507,6 +1805,13 @@ class AiLimitApp(rumps.App):
                 self._codex_status_raw = codex_status
             _save_cache(self._claude, self._codex)
             _append_history(claude, codex)
+            self._render()
+
+        with self._ip_lock:
+            ip_result = self._ip_pending
+            self._ip_pending = None
+        if ip_result is not None:
+            self._absorb_ipsec(ip_result)
             self._render()
 
         with self._update_lock:
@@ -1653,8 +1958,11 @@ class AiLimitApp(rumps.App):
                     pct = codex["7d_left"] if mode == "5h" else codex["5h_left"]
                 if pct is not None:
                     bar_items.append(("codex", "CodeX", pct, False))
+        # 盾牌跟着「详情面板 → IP 安全」这一个开关走：关掉就卡片和图标一起消失，
+        # 不给用户两个语义重叠的开关
+        shield = self._shield_level() if self._state.get("ip_security", True) else None
         try:
-            _set_bar_rings(self, bar_items, style)
+            _set_bar_rings(self, bar_items, style, shield)
         except Exception:
             # 环画不出来时（AppKit 绘图上下文异常）回退到 ▰▱ 文字版
             parts = []
@@ -1667,6 +1975,8 @@ class AiLimitApp(rumps.App):
                     parts.append(_native_bar(pct))
                 else:
                     parts.append(f"{_native_bar(pct)} {pct}")
+            if shield:
+                parts.append("🛡" + _SHIELD_GLYPHS.get(shield, "·"))
             _set_bar_title(self, "  ".join(parts) if parts else "ai-limit…")
 
         # 右键菜单里两个服务只剩状态子菜单入口，额度数据在面板里画。
@@ -1855,6 +2165,17 @@ class AiLimitApp(rumps.App):
         self._render()
         self._kick_background_fetch()
 
+    def _toggle_panel_ipsec(self, _):
+        on = not self._state.get("ip_security", True)
+        self._state["ip_security"] = on
+        _save_state(self._state)
+        self._update_panel_checks()
+        self._render()
+        if on:
+            # 重新打开时立刻测一次：10 分钟的节拍太慢，不能让用户开完盯着
+            # 一个灰盾牌等下一轮
+            self._kick_ip_fetch()
+
     def _make_set_bar_style(self, style):
         return lambda _: self._set_bar_style(style)
 
@@ -1893,14 +2214,23 @@ class AiLimitApp(rumps.App):
     def _update_panel_checks(self):
         lang = self._lang()
         panel = self._state.get("panel_services") or []
+        ip_on = self._state.get("ip_security", True)
         self._panel_claude.title = ("✓ " if "claude" in panel else "  ") + "Claude Code"
         self._panel_codex.title  = ("✓ " if "codex"  in panel else "  ") + "CodeX"
-        if not panel:
+        self._panel_ipsec.title  = ("✓ " if ip_on else "  ") + _tr(lang, "IP 安全", "IP Security")
+        # 摘要：三项之后再逐个列名字会把父行撑过 _MENU_MIN_WIDTH，
+        # 中间状态改用计数——具体勾了哪几项点开子菜单一眼就看得到
+        labels = [n for n, on in (("Claude Code", "claude" in panel),
+                                  ("CodeX", "codex" in panel),
+                                  (_tr(lang, "IP 安全", "IP Security"), ip_on)) if on]
+        if not labels:
             summary = _tr(lang, "无", "None")
-        elif len(panel) == 2:
+        elif len(labels) == 3:
             summary = _tr(lang, "全部", "All")
+        elif len(labels) == 1:
+            summary = labels[0]
         else:
-            summary = "Claude Code" if "claude" in panel else "CodeX"
+            summary = _tr(lang, f"{len(labels)} 项", f"{len(labels)} items")
         self._panel_menu.title = _tr(lang, f"详情面板（{summary}）", f"Detail panel ({summary})")
 
     # ── 立即刷新 ──────────────────────────────────────────────────────────────

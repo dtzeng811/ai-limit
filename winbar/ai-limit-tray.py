@@ -13,6 +13,10 @@
 - 左键弹 **flyout 卡片面板**（无边框、置顶、失焦自动关、深浅色跟随系统），
   对齐 Win11 电量/音量 flyout 的体验；布局复刻 Mac 版 panelui 的卡片。
 - 右键是原生托盘菜单：立即刷新 / 主窗口切换（5h/7d，影响 tooltip 首行）/ 退出。
+- 第三个托盘图标是 **IP 安全盾牌**（数据层 ipsec.py）。四种状态的**形状不同**
+  （勾/横线/感叹号/圆点），不靠颜色区分——托盘只有 16px，且要照顾色觉障碍。
+  左键**直接跳转**检测站点而不是弹 flyout：WebRTC 泄露必须浏览器才测得出，
+  面板给不出完整答案，多一次点击不如直接送到能测全的地方。
 
 行为层与 Mac 版同参数：默认 3 分钟刷新 + 0~20s 随机抖动；单次抓取失败沿用
 上一份好数据（连败 3 次或数据老于 15 分钟才报错）；连败后指数退避（上限 30
@@ -31,17 +35,19 @@ import random
 import sys
 import threading
 import time
+import webbrowser
 
 from PIL import Image, ImageDraw
 
 # PyInstaller onefile 打包后 __file__ 在临时解包目录（sys._MEIPASS），
-# usage.py 由 build-win.ps1 的 --add-data 塞在解包根；源码运行时在仓库根。
+# usage.py / ipsec.py 由 build-win.ps1 的 --add-data 塞在解包根；源码运行时在仓库根。
 if getattr(sys, "frozen", False):
     _REPO = pathlib.Path(sys._MEIPASS)
 else:
     _REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+import ipsec  # noqa: E402  IP 安全度数据层（跨平台）
 import usage  # noqa: E402  数据层（跨平台）
 from usage import (  # noqa: E402
     ClaudeWebError, CodexAuthError, CodexWebError,
@@ -79,6 +85,21 @@ _BADGE_COLORS   = {"warn": "#F5C518", "crit": "#E04343"}
 _ICON_PX     = 64      # 高分画布，Windows 按 DPI 自行缩放
 _RING_LW     = 9
 _TRACK_ALPHA = 72      # 0-255
+
+# IP 安全盾牌。轮廓比环细一档：盾形本身占的面积比环大，同样 9px 会糊成一块实心
+_SHIELD_LW     = 7
+_SHIELD_COLORS = {
+    ipsec.SHIELD_OK:   "#3FB950",
+    ipsec.SHIELD_WARN: "#F5C518",
+    ipsec.SHIELD_CRIT: "#E04343",
+    ipsec.SHIELD_IDLE: "#8A8A8A",
+}
+# IP/DNS 状态不会分钟级变化，独立于额度的 3 分钟走 10 分钟一轮
+_IPSEC_REFRESH_SEC = 10 * 60
+# 沿用上次结果的过期上限。额度那边是 15 分钟（= 5 个 3 分钟周期），IP 这边一轮
+# 就是 10 分钟，用 15 分钟会让第 2 次失败就因"数据过期"变灰，抢在"连败 3 次"
+# 规则之前触发——所以按 IP 自己的节奏放宽到 4 轮
+_IPSEC_STALE_MAX_SEC = 4 * _IPSEC_REFRESH_SEC
 
 
 def _detect_lang() -> str:
@@ -169,6 +190,63 @@ class ServiceState:
         return time.time() < self.backoff_until
 
 
+class IPState:
+    """IP 安全检测状态 + 失败记账。
+
+    抖动抑制的哲学与 ServiceState 一致（单次失败沿用上次好结果，连败/过期才
+    如实报，连败后指数退避），但**失败的呈现完全不同**：
+
+    额度抓不到就显示错误文本，用户一眼知道是"没读到"。盾牌只有一个形状位，
+    如果检测失败画成红盾，用户会以为"网络被判定为不安全"——那是最坏的误导。
+    所以这里失败一律落到**灰**（SHIELD_IDLE）：红留给真的测出问题，灰表示
+    没测到。这也是设计文档第 4 节写死的规则。
+    """
+
+    def __init__(self, refresh_sec_fn):
+        self.data = None            # ipsec.probe() 的返回
+        self.fail = 0
+        self.good_ts = 0.0
+        self.backoff_until = 0.0
+        self._refresh_sec = refresh_sec_fn
+
+    @staticmethod
+    def _failed(d) -> bool:
+        """probe() 只在整轮拿不到数据（trace 挂了）时置 error；ip.net.coffee
+        单独挂掉是 degraded=True，那仍然是一次成功的检测，不记失败。"""
+        return bool(d) and bool(d.get("error"))
+
+    def absorb(self, new):
+        if not new:
+            return
+        if not self._failed(new):
+            self.fail = 0
+            self.good_ts = time.time()
+            self.backoff_until = 0.0
+            self.data = new
+            return
+        self.fail += 1
+        over = self.fail - _FAIL_GRACE_N
+        if over >= 0:
+            delay = min(self._refresh_sec() * (2 ** over), _BACKOFF_MAX_SEC)
+            self.backoff_until = time.time() + delay
+        has_good = bool(self.data) and not self._failed(self.data)
+        fresh = (time.time() - self.good_ts) <= _IPSEC_STALE_MAX_SEC
+        if has_good and fresh and self.fail < _FAIL_GRACE_N:
+            return                  # 吸收：沿用上次好结果，盾牌不动
+        self.data = new
+
+    def in_backoff(self) -> bool:
+        return time.time() < self.backoff_until
+
+    def level(self) -> str:
+        """盾牌档位。注意 probe() 在 claude.ai 不可达时返回 level=crit，但走到
+        这里说明 absorb 已经判定为"连败/过期"——按上面的理由改判灰。"""
+        d = self.data
+        if not d or self._failed(d):
+            return ipsec.SHIELD_IDLE
+        return d.get("level") or ipsec.SHIELD_IDLE
+
+
 # ── 数据抓取（镜像 menubar 的 fetch 契约） ───────────────────────────────────
 _plan_cache = {"plan": None, "ts": 0.0}
 
@@ -244,6 +322,18 @@ def fetch_codex():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def fetch_ipsec():
+    """跑一轮 IP 安全检测。
+
+    ipsec.probe() 号称任何单探针失败都不抛异常，但它跑在共用的抓取线程里——
+    真漏出一个异常会连额度轮询一起打死，所以这里再兜一层。
+    """
+    try:
+        return ipsec.probe()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "level": ipsec.SHIELD_IDLE}
+
+
 _FETCHERS = {"claude": fetch_claude, "codex": fetch_codex}
 
 
@@ -287,6 +377,55 @@ def _draw_badge(d: ImageDraw.ImageDraw, px: int, color: str):
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_hex_rgba(color))
 
 
+def _shield_pts(px: int):
+    """盾形五边形顶点：顶边平、两侧竖下、底部收成尖。
+
+    坐标按 64px 画布手调后按比例缩放——托盘实际尺寸随 DPI 在 16~32px 之间，
+    等比缩放能保证小尺寸下轮廓仍读得出是"盾"而不是一坨。
+    """
+    s = px / 64.0
+    return [(6 * s, 6 * s), (58 * s, 6 * s), (58 * s, 32 * s),
+            (32 * s, 59 * s), (6 * s, 32 * s)]
+
+
+def render_shield(level: str, px: int = _ICON_PX) -> Image.Image:
+    """IP 安全盾牌托盘图标。
+
+    四种状态**形状不同**（勾 / 横线 / 感叹号 / 圆点），不只是换色：托盘图标
+    实际只有 16~32px，颜色在浅色任务栏上区分度本就有限，加上色觉障碍用户
+    分不清红绿——形状是唯一可靠的语义通道。颜色只是冗余强化。
+    """
+    img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    color = _hex_rgba(_SHIELD_COLORS.get(level, _SHIELD_COLORS[ipsec.SHIELD_IDLE]))
+    lw = max(2, round(_SHIELD_LW * px / _ICON_PX))
+    s = px / 64.0
+
+    pts = _shield_pts(px)
+    # 用 line 闭合描边而不是 polygon(outline=)：polygon 的 width 参数在旧
+    # Pillow 上不生效，line + joint="curve" 各版本都有，拐角也更圆润
+    d.line(pts + [pts[0]], fill=color, width=lw, joint="curve")
+
+    # 内符号一律待在盾牌"肩部以上"的宽敞区（y<38）：底下是收尖的三角，
+    # 缩到 16px 时任何伸进去的笔画都会和轮廓糊成一团
+    if level == ipsec.SHIELD_OK:            # 勾
+        d.line([(21 * s, 27 * s), (28 * s, 35 * s), (44 * s, 17 * s)],
+               fill=color, width=lw, joint="curve")
+    elif level == ipsec.SHIELD_WARN:        # 横线
+        d.line([(21 * s, 26 * s), (43 * s, 26 * s)], fill=color, width=lw)
+    elif level == ipsec.SHIELD_CRIT:        # 感叹号（竖线 + 点）
+        # 竖线起点压到 y=19 而不是 14：盾牌顶边在 y≈8，14 在 64px 下看着没事，
+        # 缩到 16px 只差 1.5px，抗锯齿一糊就跟顶边并成一条，读起来像"T"而不是
+        # 感叹号——四个符号里唯独红色最不该认错。点也跟着下移保持间距。
+        d.line([(32 * s, 19 * s), (32 * s, 31 * s)], fill=color, width=lw)
+        r = max(lw / 2.0, 1.0)
+        d.ellipse([32 * s - r, 38 * s - r, 32 * s + r, 38 * s + r], fill=color)
+    else:                                    # 圆点
+        r = 7 * s
+        d.ellipse([32 * s - r, 25 * s - r, 32 * s + r, 25 * s + r], fill=color)
+    return img
+
+
 # ── tooltip / 重置时间格式化 ─────────────────────────────────────────────────
 def _fmt_reset(val) -> str:
     """5h_reset 是 ISO 字符串（Claude）或 epoch（CodeX），统一转本地 HH:MM。"""
@@ -322,20 +461,107 @@ def make_tooltip(service: str, st: ServiceState, mode: str) -> str:
     return f"{title} {parts[0]}\n{parts[1]}{stale}"[:127]
 
 
+# ── IP 安全卡片文案（判定在 ipsec，i18n 与格式化留在各端 UI 层） ─────────────
+def _IP_TITLE() -> str:
+    return tr("IP 安全", "IP security")
+
+
+def ip_level_word(level: str) -> str:
+    return {
+        ipsec.SHIELD_OK:   tr("正常", "OK"),
+        ipsec.SHIELD_WARN: tr("出口 IP 有变化", "Exit IP changed"),
+        ipsec.SHIELD_CRIT: tr("有风险", "At risk"),
+    }.get(level, tr("未检测到", "No result"))
+
+
+def ip_abuse_word(score) -> str:
+    """abuser_score 形如 "0.0039 (Low)"。卡片一行放不下小数，只取括号里的
+    等级词——用户要的是"高不高"，不是第四位小数。"""
+    if not score:
+        return ""
+    s = str(score)
+    if "(" in s and ")" in s:
+        return s[s.index("(") + 1:s.index(")")].strip()
+    return s
+
+
+def ip_risk_chips(d) -> list:
+    """风险标签。机房 IP 不点亮盾牌（长期走机房出口的人会被常亮告警淹没），
+    但必须在卡片里如实标出来——它是 Claude 风控最看重的信号之一。"""
+    out = []
+    if d.get("is_datacenter"):
+        out.append(tr("机房 IP", "Datacenter"))
+    if d.get("is_vpn"):
+        out.append("VPN")
+    if d.get("is_proxy"):
+        out.append(tr("代理", "Proxy"))
+    if d.get("is_tor"):
+        out.append("Tor")
+    if d.get("is_abuser"):
+        out.append(tr("滥用", "Abuser"))
+    return out
+
+
+def ip_dns_text(d):
+    """DNS 行 → (正文, 标签, 标签是否告警)。三态必须分清：
+
+    - 有出口且异国      → 真泄露
+    - 有出口且同国 / 空 → 安全（Clash fake-IP 下 DNS 不出公网，恒为空，
+                          这在参考站点的判定里正是"安全"，不是检测失败）
+    - dns_ok=False      → 本轮没测到，既不能报安全也不能报泄露
+    """
+    if d.get("dns_leaked"):
+        names = [s.get("country") or s.get("country_name") or "?"
+                 for s in (d.get("dns_servers") or [])]
+        # 只报出口在哪国——"与本机不同国"这层意思由红色 + 泄露标签承担，
+        # 一行 190px 塞不下完整句子
+        return (tr("出口在 ", "Resolver in ") + "/".join(names[:2]),
+                tr("泄露", "Leak"), True)
+    if not d.get("dns_ok"):
+        return tr("本轮未测到", "No result this round"), "", False
+    if d.get("dns_servers"):
+        return tr("出口与本机同国", "Resolver in same country"), tr("安全", "Safe"), False
+    return tr("未暴露出口（加密）", "No exposed resolver"), tr("安全", "Safe"), False
+
+
+def make_ip_tooltip(ip_state) -> str:
+    """盾牌托盘悬浮文本（Windows 上限 128 字符）。"""
+    head = _IP_TITLE()
+    d = ip_state.data
+    if not d:
+        return f"{head} · {tr('检测中…', 'checking…')}"
+    if not d.get("error"):
+        loc = " · ".join(x for x in (d.get("country") or d.get("loc"), d.get("city")) if x)
+        second = f"{d.get('ip') or '?'}" + (f" · {loc}" if loc else "")
+        if d.get("degraded"):
+            second += tr(" · 风险数据不可用", " · risk data unavailable")
+        return f"{head} {ip_level_word(ip_state.level())}\n{second}"[:127]
+    # 连败落到这里：说的是"没测到"，不是"测到问题"——措辞不能像告警
+    return f"{head} · {tr('检测不可用', 'check unavailable')}\n{d.get('error') or ''}"[:127]
+
+
 # ── flyout 卡片面板（tkinter，仅 Windows 有完整体验；懒加载可脱离测试） ───────
 class Flyout:
     """无边框置顶卡片小窗：布局复刻 Mac 版 panelui（服务名+方案 / 环+大号
     百分比+重置时间 ×2），深浅色跟随系统（注册表 AppsUseLightTheme）。
-    失焦自动隐藏，贴近点击位置（托盘点击时鼠标就在托盘上）。"""
+    失焦自动隐藏，贴近点击位置（托盘点击时鼠标就在托盘上）。
 
-    W, CARD_H, PAD = 300, 96, 10
+    第三张 IP 安全卡片整块是点击热区（Canvas 上判坐标）——它给不出 WebRTC
+    的答案，点进网页才是完整检测，所以卡片本身就是那个入口。
+    """
 
-    def __init__(self, root, states: dict, state: dict):
+    W, CARD_H, IP_CARD_H, PAD = 300, 96, 112, 10
+
+    def __init__(self, root, states: dict, state: dict, ip_state=None):
         self.root = root
         self.states = states
         self.state = state
+        self.ip_state = ip_state
         self.win = None
         self._hide_job = None
+        self._ip_rect = None     # IP 卡片的点击热区（画完才知道，见 _ip_card）
+        self._ip_hint = None     # 悬停提示的 canvas item id
+        self._ip_hover = False
 
     # 主题
     @staticmethod
@@ -363,6 +589,8 @@ class Flyout:
         fg    = "#FFFFFF" if dark else "#1A1A1A"
         sub   = "#9E9E9E" if dark else "#6E6E6E"
         h = self.PAD + len(self.states) * (self.CARD_H + self.PAD) + 24
+        if self.ip_state is not None:
+            h += self.IP_CARD_H + self.PAD
 
         if self.win is None or not self.win.winfo_exists():
             self.win = tk.Toplevel(self.root)
@@ -371,6 +599,11 @@ class Flyout:
             self.canvas = tk.Canvas(self.win, highlightthickness=0, bd=0)
             self.canvas.pack(fill="both", expand=True)
             self.win.bind("<Escape>", lambda e: self.win.withdraw())
+            # Canvas 是自绘的，没有控件层级可以挂事件，只能整块收鼠标事件后
+            # 自己判坐标落在哪张卡片上
+            self.canvas.bind("<Button-1>", self._on_click)
+            self.canvas.bind("<Motion>", self._on_motion)
+            self.canvas.bind("<Leave>", lambda e: self._set_hover(False))
             # 不能在这里直接 bind FocusOut：Windows 禁止后台进程抢焦点，
             # focus_force() 常常拿不到（或瞬间被收回）→ FocusOut 立即触发
             # → 窗口弹出几毫秒就被自己收掉，肉眼只觉得"点了没反应"。
@@ -395,6 +628,12 @@ class Flyout:
             st = self.states[svc]
             self._card(svc, st, mode, y0, card, fg, sub, f_title, f_big, f_sub)
             y0 += self.CARD_H + self.PAD
+
+        self._ip_rect = None
+        self._ip_hover = False
+        if self.ip_state is not None:
+            self._ip_card(y0, card, fg, sub, f_title, f_sub)
+            y0 += self.IP_CARD_H + self.PAD
 
         ts = time.strftime("%H:%M:%S")
         retry = [s for s in ("claude", "codex") if self.states[s].fail > 0]
@@ -470,6 +709,187 @@ class Flyout:
                           text=_fmt_reset(d.get(f"{key}_reset")), fill=sub, font=f_sub)
             ry += 30
 
+    # ── IP 安全卡片 ──────────────────────────────────────────────────────────
+    def _ip_card(self, y0, card_bg, fg, sub, f_title, f_sub):
+        c = self.canvas
+        x0, x1 = self.PAD, self.W - self.PAD
+        y1 = y0 + self.IP_CARD_H
+        c.create_rectangle(x0, y0, x1, y1, fill=card_bg, width=0)
+        self._ip_rect = (x0, y0, x1, y1)
+
+        lvl = self.ip_state.level()
+        accent = _SHIELD_COLORS.get(lvl, _SHIELD_COLORS[ipsec.SHIELD_IDLE])
+        d = self.ip_state.data or {}
+
+        # 标题行：小盾牌 + 标题 + 右上状态点（与 Claude/CodeX 卡片同构）
+        self._shield_glyph(x0 + 12, y0 + 8, 18, lvl, accent)
+        c.create_text(x0 + 36, y0 + 9, anchor="nw", text=_IP_TITLE(), fill=fg, font=f_title)
+        c.create_oval(x1 - 20, y0 + 13, x1 - 12, y0 + 21, fill=accent, outline="")
+        # 悬停才浮出的可点提示：常驻会和状态点抢眼球，卡片本身已经够满了
+        self._ip_hint = c.create_text(
+            x1 - 26, y0 + 11, anchor="ne", state="hidden", fill=sub, font=f_sub,
+            text=tr("在网页中检测 ↗", "Check in browser ↗"))
+
+        lx, vx = x0 + 12, x0 + 74      # 标签列 / 值列
+        ry = y0 + 34
+        step = 20
+
+        def label(text):
+            c.create_text(lx, ry + 1, anchor="nw", text=text, fill=sub, font=f_sub)
+
+        if not d:
+            label(tr("状态", "Status"))
+            c.create_text(vx, ry + 1, anchor="nw", text=tr("检测中…", "checking…"),
+                          fill=sub, font=f_sub)
+            return
+        if d.get("error"):
+            # 连败才会走到这里。措辞是"检测不可用"而不是"不安全"——
+            # 灰盾 + 这行字共同表达"没测到"，别让用户以为网络被判危险
+            label(tr("状态", "Status"))
+            c.create_text(vx, ry + 1, anchor="nw", text=tr("检测不可用", "Check unavailable"),
+                          fill=sub, font=f_sub)
+            ry += step
+            c.create_text(lx, ry + 1, anchor="nw", text=str(d.get("error") or "")[:44],
+                          fill=sub, font=f_sub)
+            return
+
+        rx = x1 - 12                   # 值区右边界，所有行共用这个预算
+
+        # 出口 IP
+        label(tr("出口 IP", "Exit IP"))
+        ip_txt = d.get("ip") or "—"
+        c.create_text(vx, ry + 1, anchor="nw", text=ip_txt, fill=fg, font=f_sub)
+        loc = " · ".join(x for x in (d.get("country") or d.get("loc"), d.get("city")) if x)
+        if loc:
+            lx2 = vx + f_sub.measure(ip_txt) + 10
+            c.create_text(lx2, ry + 1, anchor="nw", fill=sub, font=f_sub,
+                          text=self._fit(loc, f_sub, rx - lx2))
+        ry += step
+
+        # 风险
+        label(tr("风险", "Risk"))
+        if d.get("degraded"):
+            c.create_text(vx, ry + 1, anchor="nw", text=tr("不可用", "Unavailable"),
+                          fill=sub, font=f_sub)
+        else:
+            cx = vx
+            for chip in ip_risk_chips(d):
+                w = self._chip_w(chip, f_sub)
+                if cx + w > rx:
+                    break              # 一行放不下就不放了：截半个胶囊比少一个更难看
+                danger = chip in ("Tor", tr("滥用", "Abuser"))
+                cx = self._chip(cx, ry - 1, chip, f_sub, card_bg,
+                                _BADGE_COLORS["crit"] if danger else sub)
+            score = ip_abuse_word(d.get("abuser_score"))
+            score_txt = f"{tr('滥用分', 'Abuse')} {score}" if score else ""
+            if score_txt and cx + f_sub.measure(score_txt) <= rx:
+                c.create_text(cx, ry + 1, anchor="nw", text=score_txt, fill=sub, font=f_sub)
+            elif cx == vx:
+                c.create_text(vx, ry + 1, anchor="nw", text=tr("无标记", "No flags"),
+                              fill=sub, font=f_sub)
+        ry += step
+
+        # DNS
+        label("DNS")
+        dns_txt, dns_chip, dns_bad = ip_dns_text(d)
+        chip_w = (self._chip_w(dns_chip, f_sub) + 2) if dns_chip else 0
+        dns_txt = self._fit(dns_txt, f_sub, rx - vx - chip_w - 8)
+        c.create_text(vx, ry + 1, anchor="nw", text=dns_txt,
+                      fill=fg if not dns_bad else _BADGE_COLORS["crit"], font=f_sub)
+        if dns_chip:
+            self._chip(vx + f_sub.measure(dns_txt) + 8, ry - 1, dns_chip, f_sub, card_bg,
+                       _BADGE_COLORS["crit"] if dns_bad else _SHIELD_COLORS[ipsec.SHIELD_OK])
+        ry += step
+
+        # WebRTC：纯 HTTP 客户端测不了（要浏览器建 RTCPeerConnection 收 ICE），
+        # 如实标注而不是伪装成已检测，箭头把用户引到能测的地方
+        label("WebRTC")
+        c.create_text(vx, ry + 1, anchor="nw", text=tr("需浏览器检测", "Browser needed"),
+                      fill=sub, font=f_sub)
+        c.create_text(x1 - 12, ry + 1, anchor="ne", text="→", fill=sub, font=f_sub)
+
+    @staticmethod
+    def _chip_w(text, font) -> int:
+        return font.measure(text) + 10
+
+    def _chip(self, x, y, text, font, card_bg, accent):
+        """标签胶囊，返回下一个可用 x。tkinter Canvas 没有圆角矩形原语，用直角
+        小矩形——这个尺寸下圆角肉眼看不出来，不值得拿 arc 拼一个。"""
+        w = self._chip_w(text, font)
+        self.canvas.create_rectangle(x, y, x + w, y + 16,
+                                     fill=self._mix(card_bg, accent, 0.22), width=0)
+        self.canvas.create_text(x + 5, y + 2, anchor="nw", text=text, fill=accent, font=font)
+        return x + w + 6
+
+    @staticmethod
+    def _fit(text, font, max_px) -> str:
+        """按**像素**宽截断而不是按字数。中英混排下 24 个字符可能是 130px 也可能
+        是 260px，按字数截要么白留半张卡片、要么直接冲出卡片右边。"""
+        if max_px <= 0 or font.measure(text) <= max_px:
+            return text
+        while text and font.measure(text + "…") > max_px:
+            text = text[:-1]
+        return text + "…"
+
+    def _shield_glyph(self, x, y, size, level, color):
+        """卡片标题前的小盾牌。几何直接复用托盘图标的 _shield_pts——两处形状
+        必须一模一样，用户才能把这张卡片和托盘上那个图标对上号。"""
+        c = self.canvas
+        s = size / 64.0
+        lw = 2
+        pts = []
+        for px_, py_ in _shield_pts(size):
+            pts += [x + px_, y + py_]
+        c.create_polygon(pts, outline=color, fill="", width=lw)
+        if level == ipsec.SHIELD_OK:
+            c.create_line(x + 21 * s, y + 27 * s, x + 28 * s, y + 35 * s,
+                          x + 44 * s, y + 17 * s, fill=color, width=lw)
+        elif level == ipsec.SHIELD_WARN:
+            c.create_line(x + 21 * s, y + 26 * s, x + 43 * s, y + 26 * s, fill=color, width=lw)
+        elif level == ipsec.SHIELD_CRIT:
+            c.create_line(x + 32 * s, y + 13 * s, x + 32 * s, y + 28 * s, fill=color, width=lw)
+            c.create_oval(x + 32 * s - 1, y + 34 * s - 1, x + 32 * s + 1, y + 34 * s + 1,
+                          fill=color, outline=color)
+        else:
+            r = 6 * s
+            c.create_oval(x + 32 * s - r, y + 25 * s - r, x + 32 * s + r, y + 25 * s + r,
+                          fill=color, outline=color)
+
+    # ── 卡片交互 ────────────────────────────────────────────────────────────
+    def _in_ip_card(self, ev) -> bool:
+        r = self._ip_rect
+        return bool(r) and r[0] <= ev.x <= r[2] and r[1] <= ev.y <= r[3]
+
+    def _on_click(self, ev):
+        if self._in_ip_card(ev):
+            webbrowser.open(ipsec.SITE_URL)
+            # 跳走了就收起面板：浏览器会抢焦点，留个孤零零的置顶小窗很碍事
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+
+    def _on_motion(self, ev):
+        self._set_hover(self._in_ip_card(ev))
+
+    def _set_hover(self, on: bool):
+        if on == self._ip_hover:
+            return                       # Motion 每像素都触发，不去重会白刷一堆 configure
+        self._ip_hover = on
+        try:
+            if self._ip_hint is not None:
+                self.canvas.itemconfigure(self._ip_hint, state="normal" if on else "hidden")
+            self.canvas.configure(cursor="hand2" if on else "")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _mix(c1: str, c2: str, t: float) -> str:
+        """两个 hex 色线性插值。深浅两套主题下都要得到"比卡片底色深一层"的
+        标签底，所以混的是卡片底色而不是固定灰。"""
+        a, b = _hex_rgba(c1), _hex_rgba(c2)
+        return "#" + "".join(f"{int(a[i] * (1 - t) + b[i] * t):02x}" for i in range(3))
+
     @staticmethod
     def _alpha(hex_color: str, a: float) -> str:
         """tkinter 不支持 alpha，把品牌色向背景灰混合模拟低透明底环。"""
@@ -518,16 +938,19 @@ def main():
     ui_queue: "queue.Queue[str]" = queue.Queue()
     stop_evt = threading.Event()
     wake_evt = threading.Event()   # 手动刷新时打断休眠
+    ip_force = threading.Event()   # 盾牌菜单的「立即刷新」跳过 10 分钟节流
     refresh_sec = lambda: state["refresh_min"] * 60
     states = {k: ServiceState(k, refresh_sec) for k in ("claude", "codex")}
+    ip_state = IPState(lambda: _IPSEC_REFRESH_SEC)
 
     root = tk.Tk()
     root.withdraw()
     # tkinter 回调里的异常默认打 stderr 就没了，统一落盘（%TEMP%\ai-limit-tray.log）
     root.report_callback_exception = lambda *a: _log_exc("tk-callback")
-    flyout = Flyout(root, states, state)
+    flyout = Flyout(root, states, state, ip_state)
 
-    icons: dict[str, "pystray.Icon"] = {}
+    icons: dict[str, "pystray.Icon"] = {}   # 环图标（claude/codex），盾牌另存
+    shield: "pystray.Icon | None" = None
 
     def repaint():
         mode = state["mode"]
@@ -543,9 +966,16 @@ def main():
                 icon.icon = render_icon(svc, pct if pct is not None else 0)
             icon.title = make_tooltip(svc, st, mode)
 
+    def repaint_shield():
+        if shield is None:
+            return
+        shield.icon = render_shield(ip_state.level())
+        shield.title = make_ip_tooltip(ip_state)
+
     # ── 抓取线程：jitter + 退避跳过 + absorb，然后重画图标 ──
     def fetch_loop():
         first = True
+        ip_due = 0.0        # 0 = 首轮立刻测一次，之后按 _IPSEC_REFRESH_SEC 走
         while not stop_evt.is_set():
             if not first:
                 wake_evt.wait(timeout=refresh_sec() + random.uniform(0, _JITTER_MAX_SEC))
@@ -559,6 +989,16 @@ def main():
                 st.absorb(_FETCHERS[svc]())
             repaint()
 
+            # IP 检测挂在同一个线程但走自己的时钟：一轮探针含 DNS 轮询要好几秒，
+            # 放在额度重画之后，别让盾牌拖慢用户真正天天看的额度数字
+            forced = ip_force.is_set()      # 手动刷新无视节流和退避
+            if forced:
+                ip_force.clear()
+            if forced or (time.time() >= ip_due and not ip_state.in_backoff()):
+                ip_state.absorb(fetch_ipsec())
+                ip_due = time.time() + _IPSEC_REFRESH_SEC + random.uniform(0, _JITTER_MAX_SEC)
+                repaint_shield()
+
     # ── 托盘回调（pystray 线程）→ 主线程队列 ──
     def on_flyout(icon, item):
         ui_queue.put("flyout")
@@ -566,6 +1006,16 @@ def main():
     def on_refresh(icon, item):
         for st in states.values():
             st.backoff_until = 0.0
+        wake_evt.set()
+
+    def on_ip_open(icon, item):
+        # pystray 回调在它自己的线程里，一律经 ui_queue 交给主线程——
+        # webbrowser.open 在 Windows 上会起子进程，跨线程调用不值得赌
+        ui_queue.put("ip-open")
+
+    def on_ip_refresh(icon, item):
+        ip_state.backoff_until = 0.0
+        ip_force.set()
         wake_evt.set()
 
     def make_mode_setter(m):
@@ -595,13 +1045,25 @@ def main():
         pystray.MenuItem(tr("退出", "Quit"), on_quit),
     )
 
+    # 盾牌的默认动作是直接跳转，不弹 flyout：面板给不出 WebRTC 的答案，
+    # 网页才是完整检测，中间插一层面板只是多一次点击
+    shield_menu = pystray.Menu(
+        pystray.MenuItem(tr("在网页中检测", "Check in browser"), on_ip_open, default=True),
+        pystray.MenuItem(tr("立即刷新", "Refresh now"), on_ip_refresh),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(tr("退出", "Quit"), on_quit),
+    )
+
     for svc in ("claude", "codex"):
         icons[svc] = pystray.Icon(
             f"ai-limit-{svc}", render_icon(svc, 0),
             f"{_SERVICE_TITLES[svc]} · {tr('读取中…', 'loading…')}", menu)
+    shield = pystray.Icon(
+        "ai-limit-ipsec", render_shield(ipsec.SHIELD_IDLE),
+        f"{_IP_TITLE()} · {tr('检测中…', 'checking…')}", shield_menu)
 
     threading.Thread(target=fetch_loop, daemon=True).start()
-    for icon in icons.values():
+    for icon in list(icons.values()) + [shield]:
         icon.run_detached()
 
     # ── 主线程：tkinter loop + 队列轮询 ──
@@ -611,9 +1073,12 @@ def main():
                 msg = ui_queue.get_nowait()
                 if msg == "flyout":
                     flyout.toggle()
+                elif msg == "ip-open":
+                    webbrowser.open(ipsec.SITE_URL)
                 elif msg == "quit":
-                    for icon in icons.values():
-                        icon.stop()
+                    for icon in list(icons.values()) + [shield]:
+                        if icon is not None:
+                            icon.stop()
                     root.destroy()
                     return
         except queue.Empty:

@@ -1,6 +1,6 @@
 # IP 安全度检测 — 设计文档
 
-**状态**：已确认，待实现
+**状态**：✅ 已实现并发布（v0.3.23-fork.5，2026-07-27）
 **日期**：2026-07-26
 **目标**：在 ai-limit 双端新增 IP 安全度指示（盾牌图标 + 面板卡片），点击跳转 `https://ip.net.coffee/claude/`
 
@@ -146,13 +146,13 @@ def probe() -> dict:
 
 ---
 
-## 7. 验收标准
+## 7. 验收标准（2026-07-27 全部验证通过）
 
-- [ ] `ipsec.probe()` 在本机返回 `level="ok"`（或 IP 刚变时 `warn`）、`dns_leaked=False`、`is_datacenter=True`
-- [ ] 三个探针各自失败时，`probe()` 不抛异常，降级字段正确
-- [ ] macOS 菜单栏出现盾牌，四种状态渲染正确，总宽 ≈119px
-- [ ] macOS 面板出现 IP 卡片，点击跳转浏览器
-- [ ] Windows 出现第三个托盘图标，左键跳转，flyout 出现 IP 卡片
-- [ ] 连续 3 次失败盾牌变灰而非变红
-- [ ] 不产生对 `/api/session` 的请求
-- [ ] 双端离线单测覆盖判定表全部分支
+- [x] `ipsec.probe()` 在本机返回 `level="ok"`、`dns_leaked=False`、`is_datacenter=True` — 实测通过（colo=LAX，abuser_score=0.0039 Low）
+- [x] 三个探针各自失败时 `probe()` 不抛异常，降级字段正确 — 打桩单测覆盖 trace 失败 / iprisk 挂（degraded=True）/ DNS 探针失败三条路径
+- [x] macOS 菜单栏出现盾牌，四种状态渲染正确 — 实测总宽 **117px**（无盾牌 99px），四态形状经离屏渲染肉眼确认可区分
+- [x] macOS 面板出现 IP 卡片，点击跳转浏览器 — 卡片绘制与 mouseDown 命中区已接入，截图确认
+- [x] Windows 出现第三个托盘图标，左键跳转，flyout 出现 IP 卡片 — VM 实测确认
+- [x] 连续 3 次失败盾牌变灰而非变红 — 单测覆盖（含 probe 判 crit 但连败仍给灰的边界）
+- [x] 不产生对 `/api/session` 的请求 — AST 扫描确认代码字面量中仅有 `iprisk`/`geoip`/`dns/result` 三个纯查询接口
+- [x] 双端离线单测覆盖判定表全部分支 — `test_ipsec.py` 29 项 + `test_winbar_ipsec.py` 69 项，全部 ALL PASS

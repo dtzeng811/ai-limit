@@ -23,6 +23,31 @@
   <td><img src="docs/screenshot-panel-dark.png" width="300" /></td>
 </tr></table>
 
+## IP 安全度（fork 版新增）
+
+菜单栏 / 托盘常驻一个盾牌，反映当前网络环境对 Claude 是否安全。**点击跳转 [ip.net.coffee/claude](https://ip.net.coffee/claude/)** 做完整检测（含 WebRTC）。
+
+![盾牌四态](docs/screenshot-shields.png)
+
+四种状态**形状不同**，不只是换色——托盘图标只有 16px，颜色在浅色任务栏上区分度有限，还要照顾色觉障碍：
+
+| 盾牌 | 含义 | 触发条件 |
+|---|---|---|
+| 🟢 勾 | 正常 | claude.ai 可达、DNS 未泄露、IP 无异常标记 |
+| 🟡 横线 | 需注意 | 出口 IP 相比上次发生变化（换节点） |
+| 🔴 感叹号 | 有问题 | claude.ai 不可达 / DNS 出口国家 ≠ 出口 IP 国家 / IP 被标记为滥用源 |
+| ⚪ 圆点 | 没测到 | 检测中，或连续 3 次失败——**不是红**，「没测到」与「测到问题」必须分开 |
+
+面板里的 IP 安全卡片给出细节，整张卡片可点击跳转：
+
+![IP 卡片](docs/screenshot-ip-card.png)
+
+**数据来源**：复刻该站点自身调用的接口，与网页显示同源——`claude.ai/cdn-cgi/trace` 拿 Claude 视角的出口 IP 与可用性，`ip.net.coffee/api/iprisk/` 拿风险判定（网页那个信任评分的原始数据），DNS 泄露走该站的 token 机制（向 `<token>-N.d.ip.net.coffee` 触发解析，再查谁来解析的）。检测 10 分钟一轮，**不调用该站的 `/api/session`**（那是用于共享分析的 IP 上报，与检测无关）。
+
+**机房 IP 不点亮盾牌**，只在卡片里以标签注明——长期走机房出口的人会导致盾牌常年黄灯，告警就失去意义了。
+
+**WebRTC 不做后台检测**：它必须由浏览器建立 `RTCPeerConnection` 收集 ICE candidate 才测得出，任何后台程序都做不到。卡片如实标注「需浏览器检测 →」并作为跳转钩子，不伪装成已检测。
+
 ## 可靠性（fork 版新增）
 
 - **抖动抑制**：claude.ai / chatgpt.com 会对非浏览器请求做随机人机校验（TLS 指纹），单次抓取失败是常态。fork 版失败时沿用上一份好数据，**连续失败 3 次（或数据老于 15 分钟）才显示 ⚠️**，冷启动和未登录照样立刻报错。实测回放：CodeX 误报从 25 分钟降到 1 分钟。吸收期间面板 footer 显示「重试中」。
@@ -60,6 +85,10 @@ Windows 通知区域每个应用只有一个 16~32px 图标位，塞不下 macOS
 - **右键**：立即刷新 / 主显示窗口切换（5h/7d）/ 退出
 
 行为与 macOS 版一致：默认 3 分钟刷新 + 随机抖动、单次失败沿用旧数据（连败 3 次才报 ⚠）、连败指数退避。
+
+第三个托盘图标是 **IP 安全盾牌**（见上文），左键直接跳转检测站点：
+
+![Windows 三图标](docs/screenshot-windows-tray-ip.png)
 
 <table><tr>
   <td><img src="docs/screenshot-windows-tray.png" width="320" /></td>

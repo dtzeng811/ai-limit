@@ -224,8 +224,8 @@ class PanelView(AppKit.NSView):
         {"kind": "ip", "icon": "shield", "title": "IP 安全", "hint": "在网页中检测 ↗",
          "status_color": "#76AD2A", "error": None,
          "rows": [{"label": "出口 IP", "parts": [
-                     {"t": "text", "s": "199.19.104.157", "mono": True},
-                     {"t": "text", "s": "US · Los Angeles", "dim": True},
+                     {"t": "text", "s": "203.0.113.42", "mono": True},
+                     {"t": "text", "s": "US · San Jose", "dim": True},
                      {"t": "tag",  "s": "机房 IP", "tone": None}]}, ...]},
       ],
       "footer": "1 分钟刷新 · 上次 11:52:58",

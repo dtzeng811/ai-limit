@@ -18,9 +18,9 @@
 
 | 接口 | 用途 | 实测结果 |
 |---|---|---|
-| `https://claude.ai/cdn-cgi/trace` | Claude 视角的出口 IP + 可用性 | ✅ `ip=199.19.104.157 loc=US colo=LAX warp=off` |
+| `https://claude.ai/cdn-cgi/trace` | Claude 视角的出口 IP + 可用性 | ✅ `ip=203.0.113.42 loc=US colo=SJC warp=off` |
 | `https://ip.net.coffee/api/iprisk/<ip>` | IP 风险判定（信任分原始数据） | ✅ `is_datacenter=true, is_vpn/proxy/tor/abuser=false, abuser_score="0.0039 (Low)", company_type="hosting"` |
-| `https://ip.net.coffee/api/geoip/<ip>` | 地理与 ISP | ✅ `United States / California / Los Angeles / IT7 Networks Inc` |
+| `https://ip.net.coffee/api/geoip/<ip>` | 地理与 ISP | ✅ `United States / California / San Jose / Example Networks Inc` |
 | `https://ip.net.coffee/api/dns/result/<token>` | DNS 泄露检测结果 | ✅ 返回 `dns_servers: []`（即"未暴露出口"）|
 
 **DNS 检测机制**（从页面源码逆向）：客户端生成随机 token → 向 `<token>-1.d.ip.net.coffee` 和 `<token>-2.d.ip.net.coffee` 发起解析（页面用 `<img>` 触发，我们用 `socket.getaddrinfo`）→ 该站自建权威 DNS 记录下"是谁来解析的" → 轮询 `/api/dns/result/<token>` 取回 DNS 出口 IP 列表。
@@ -77,7 +77,7 @@ WebRTC 泄露必须由浏览器建立 `RTCPeerConnection` 并收集 ICE candidat
 
 ```
 🛡 IP 安全                    ●     [悬停显示：在网页中检测 ↗]
-出口 IP   199.19.104.157  US · Los Angeles
+出口 IP   203.0.113.42  US · San Jose
 风险      [机房 IP]  滥用分 Low
 DNS       未暴露出口（加密）  [安全]
 WebRTC    需浏览器检测  →

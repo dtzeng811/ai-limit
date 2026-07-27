@@ -15,3 +15,6 @@ docs/adr/
 
 # 本地开发虚拟环境（fork 版新增）
 .venv/
+
+# 设计预览（临时，不入库）
+.preview/

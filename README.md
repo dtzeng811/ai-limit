@@ -126,7 +126,7 @@ pip install browser-cookie3
 python3 linuxbar/ai-limit-tray.py
 ```
 
-开机自启：把启动命令写进 `~/.config/autostart/ai-limit-tray.desktop`。GNOME 需要 AppIndicator 扩展（Ubuntu 默认自带并启用）；其他发行版装 `snixembed` 或对应的 StatusNotifier 支持亦可。
+**开机自启**：托盘菜单里勾选「开机自启」即可（两个图标的菜单里都有），自动写入 `~/.config/autostart/`；仓库挪了位置也不用管，启动时会按当前路径自动修正（对齐 Windows 版的路径漂移自愈）。GNOME 需要 AppIndicator 扩展（Ubuntu 默认自带并启用）；其他发行版装 `snixembed` 或对应的 StatusNotifier 支持亦可。
 
 **Linux 上的 cookie 读取**：`browser_cookie3` 支持 Chrome/Chromium（走 GNOME Keyring / kwallet 解密）和 Firefox（直读 profile）。CodeX 部分未接入托盘（仅 Claude），CLI 不受影响。
 

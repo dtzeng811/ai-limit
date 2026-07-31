@@ -52,6 +52,42 @@ _ICON_PX  = 64
 _RING_LW  = 9.0
 _SHIELD_LW = 5.0
 
+# ── 开机自启（对齐 winbar 版：菜单开关 + 路径漂移自愈） ─────────────────────
+_AUTOSTART = pathlib.Path.home() / ".config" / "autostart" / "ai-limit-tray.desktop"
+
+
+def _autostart_body() -> str:
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=AI Limit Tray\n"
+        "Comment=Claude 额度 + IP 安全度托盘监控\n"
+        f"Exec={sys.executable} {pathlib.Path(__file__).resolve()}\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "X-GNOME-Autostart-Delay=10\n"
+    )
+
+
+def autostart_enabled() -> bool:
+    return _AUTOSTART.exists()
+
+
+def set_autostart(on: bool):
+    if on:
+        _AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+        _AUTOSTART.write_text(_autostart_body())
+    else:
+        _AUTOSTART.unlink(missing_ok=True)
+
+
+def heal_autostart():
+    """仓库被挪动/重命名后，自启条目里的旧路径会失效——启动时按当前路径重写。"""
+    try:
+        if _AUTOSTART.exists() and _AUTOSTART.read_text() != _autostart_body():
+            _AUTOSTART.write_text(_autostart_body())
+    except OSError:
+        pass
+
 
 # ── 图标绘制（cairo → PNG，AppIndicator 按文件名换图标） ────────────────────
 def _surface():
@@ -140,10 +176,18 @@ def _item(label, cb=None, sensitive=True):
     return it
 
 
+def _autostart_item():
+    it = Gtk.CheckMenuItem(label="开机自启")
+    it.set_active(autostart_enabled())      # 先设状态再连信号，避免误触发
+    it.connect("toggled", lambda w: set_autostart(w.get_active()))
+    return it
+
+
 # ── 主程序 ──────────────────────────────────────────────────────────────────
 class Tray:
     def __init__(self):
         _ICON_DIR.mkdir(parents=True, exist_ok=True)
+        heal_autostart()
         theme = str(_ICON_DIR)
 
         self.claude = AppIndicator.Indicator.new(
@@ -254,6 +298,7 @@ class Tray:
         m.append(_item("打开 Claude 用量页",
                        lambda *_: webbrowser.open("https://claude.ai/settings/usage")))
         m.append(Gtk.SeparatorMenuItem())
+        m.append(_autostart_item())
         m.append(_item("退出", lambda *_: Gtk.main_quit()))
         m.show_all()
         self.claude.set_menu(m)
@@ -326,6 +371,8 @@ class Tray:
         m.append(_item("立即重新检测", self.refresh_ip))
         m.append(_item("打开完整检测页面",
                        lambda *_: webbrowser.open(ipsec.SITE_URL)))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(_autostart_item())
         m.show_all()
         self.shield.set_menu(m)
 

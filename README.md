@@ -1,6 +1,6 @@
 # ai-limit（改造版）
 
-实时监控 **Claude Code** 和 **CodeX** 的剩余额度。macOS 菜单栏 + Windows 系统托盘双端。
+实时监控 **Claude Code** 和 **CodeX** 的剩余额度。macOS 菜单栏 + Windows 系统托盘 + Linux 托盘（AppIndicator）。
 
 本仓库是 [zhuchenxi113/ai-limit](https://github.com/zhuchenxi113/ai-limit) 的 fork，在上游 v0.3.23 基础上重造了整套菜单栏 UI，并加固了可靠性、大幅降低了请求量。按自己的使用需求持续迭代，不跟随上游自动更新，也不保证及时处理 issue / PR。
 
@@ -107,6 +107,28 @@ powershell -ExecutionPolicy Bypass -File winbar\build-win.ps1   # 打包单文�
 ```
 
 **Windows 上的 cookie 读取**：走 `browser_cookie3`（Chrome/Edge 用 DPAPI，Firefox 直读 profile）。注意新版 Chrome/Edge 启用了 App-Bound Encryption，cookie 可能读不出来——此时用 **Firefox 登录** claude.ai / chatgpt.com 最稳。
+
+## Linux 版（系统托盘 / AppIndicator）
+
+Ubuntu GNOME 下的托盘实现（`linuxbar/`），GTK3 + AyatanaAppIndicator3 + cairo，数据层同样直接复用仓库根的 `usage.py` / `ipsec.py`：
+
+- **Claude 环形图标**：环的填充 = 剩余额度，图标旁 label 显示百分比；GNOME 托盘 label 无法改色，告警改用符号——剩余 <20% 加 ⚠、<10% 加 ‼
+- **IP 安全盾牌**：与 mac/win 版同一套四态形状（绿勾 / 黄横线 / 红感叹号 / 灰圆点）
+- 菜单内查看 5h/7d 窗口详情、重置时间、出口 IP / ISP / DNS 泄露状态，可手动刷新、跳转完整检测页
+- 刷新策略与 mac/win 版一致：3 分钟 + 随机抖动、连败 3 次才报 ⚠、指数退避
+
+**运行**（Ubuntu 22.04+ 实测）：
+
+```bash
+git clone https://github.com/dtzeng811/ai-limit.git && cd ai-limit
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+pip install browser-cookie3
+python3 linuxbar/ai-limit-tray.py
+```
+
+开机自启：把启动命令写进 `~/.config/autostart/ai-limit-tray.desktop`。GNOME 需要 AppIndicator 扩展（Ubuntu 默认自带并启用）；其他发行版装 `snixembed` 或对应的 StatusNotifier 支持亦可。
+
+**Linux 上的 cookie 读取**：`browser_cookie3` 支持 Chrome/Chromium（走 GNOME Keyring / kwallet 解密）和 Firefox（直读 profile）。CodeX 部分未接入托盘（仅 Claude），CLI 不受影响。
 
 ## 从源码构建
 

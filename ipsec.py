@@ -21,6 +21,7 @@ WebRTC 泄露必须由浏览器建 RTCPeerConnection 收集 ICE candidate，纯 
 """
 import json
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -94,6 +95,26 @@ def probe_geoip(ip, timeout=_API_TIMEOUT):
 
 
 # ── 探针 3：DNS 泄露 ─────────────────────────────────────────────────────────
+# socket.setdefaulttimeout() 改的是**整个进程**的默认超时，不是当前线程的。
+# menubar 同时跑着额度线程（期望 15s 超时）和 IP 线程，DNS 探针最坏要跑 50 秒——
+# 这段时间里额度请求会被意外掐成 6 秒，慢网络下误判超时 → 记失败 → 最终误报 ⚠️，
+# 正好击穿这个项目整套抖动抑制的设计目的。（getaddrinfo 不接受 timeout 参数，
+# 全局开关是标准库唯一的入口，所以只能把污染窗口压到单次解析，并用锁串行化。）
+_dns_lock = threading.Lock()
+
+
+def _resolve_with_timeout(host, timeout=_DNS_TIMEOUT):
+    """带超时地解析一个域名，解析完立刻把全局超时**还原成原值**（不是 None——
+    调用方可能本来就设过别的值，无条件清零会顺手改坏它）。"""
+    with _dns_lock:
+        prev = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(timeout)
+            socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        except Exception:
+            pass                      # 无 A 记录必然抛错，查询已到达权威 DNS 即达目的
+        finally:
+            socket.setdefaulttimeout(prev)
 def probe_dns(token=None, rounds=2, polls=3, poll_gap=1.5):
     """复刻页面的 token 机制，返回 (ok, dns_servers)。
 
@@ -110,14 +131,7 @@ def probe_dns(token=None, rounds=2, polls=3, poll_gap=1.5):
     # 触发解析：这些子域没有 A 记录，getaddrinfo 必然抛错，但查询已经到达
     # 该站的权威 DNS——这正是检测所需，异常要吞掉
     for i in range(1, rounds + 1):
-        host = f"{token}-{i}.{_DNS_SUFFIX}"
-        try:
-            socket.setdefaulttimeout(_DNS_TIMEOUT)
-            socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        except Exception:
-            pass
-        finally:
-            socket.setdefaulttimeout(None)
+        _resolve_with_timeout(f"{token}-{i}.{_DNS_SUFFIX}")
 
     got_response = False
     for attempt in range(polls):

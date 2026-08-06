@@ -161,6 +161,15 @@ def draw_shield(level: str) -> str:
     return name
 
 
+# i18n：与 winbar 同名同签名的 tr()，语言判定共用 quotacore.detect_lang
+# （原先 linuxbar 界面全是硬编码中文，英文环境的用户会看到一整套中文菜单）
+LANG = quotacore.detect_lang()
+
+
+def tr(zh: str, en: str) -> str:
+    return zh if LANG == "zh" else en
+
+
 def ip_level(state) -> str:
     """IP 盾牌档位。连败/过期一律映射成灰（红只留给真的测出问题）——与
     winbar 的同名函数、设计文档第 4 节一致。"""
@@ -188,7 +197,7 @@ def _item(label, cb=None, sensitive=True):
 
 
 def _autostart_item():
-    it = Gtk.CheckMenuItem(label="开机自启")
+    it = Gtk.CheckMenuItem(label=tr("开机自启", "Launch at Login"))
     it.set_active(autostart_enabled())      # 先设状态再连信号，避免误触发
     it.connect("toggled", lambda w: set_autostart(w.get_active()))
     return it
@@ -285,41 +294,49 @@ class Tray:
     def _render_claude(self):
         d = self.usage.data
         good = d and "error" not in d
-        # bad = 当前显示的是失败态（连败到阈值 / 过期后 absorb 已把 data 换成 error）
-        bad = not good
         if good:
             left = d["7d_left" if self.show_7d else "5h_left"]
-            # 额度告警和抓取失败共用符号会叠成 "15%⚠⚠"，语义还不同。分工：
-            # 数字后的符号只表额度高低（<20% ⚠ / <10% ‼），失败态另起一个括号标注
+            # 符号分工（避免两种含义叠成 "15%⚠⚠"）：
+            #   ⚠/‼ 只表额度高低（<20% / <10%）
+            #   ~   表"这个数字是上一次的，正在重试"——吸收期沿用旧数据时，
+            #       不给任何提示会让用户以为看到的是刚测出来的实时值。
+            #       mac/win 版用 footer 的「重试中」表达，托盘 label 没有那个
+            #       位置，用一个前缀符号等价传达
             mark = "" if left >= 20 else ("⚠" if left >= 10 else "‼")
+            retry = "~" if self.usage.fail else ""
             self.claude.set_icon_full(draw_ring(left), "Claude")
-            self.claude.set_label(f"{left}%{mark}", "100%")
+            self.claude.set_label(f"{retry}{left}%{mark}", "~100%‼")
         else:
             self.claude.set_icon_full(draw_ring(0), "Claude")
-            self.claude.set_label("⚠", "100%")
+            self.claude.set_label("⚠", "~100%‼")
         self._rebuild_claude_menu()
 
     def _rebuild_claude_menu(self):
         m = Gtk.Menu()
         d = self.usage.data
         if d and "error" not in d:
-            m.append(_item(f"Claude 5h 窗口：剩 {d['5h_left']}%  (重置 {_fmt_reset(d['5h_reset'])})"))
-            m.append(_item(f"Claude 7d 窗口：剩 {d['7d_left']}%  (重置 {_fmt_reset(d['7d_reset'])})"))
-            m.append(_item("更新于 " + time.strftime("%H:%M:%S", time.localtime(self.usage.good_ts))))
+            for key in ("5h", "7d"):
+                m.append(_item(tr(
+                    f"Claude {key} 窗口：剩 {d[key + '_left']}%  (重置 {_fmt_reset(d[key + '_reset'])})",
+                    f"Claude {key}: {d[key + '_left']}% left  (resets {_fmt_reset(d[key + '_reset'])})")))
+            m.append(_item(tr("更新于 ", "updated ") +
+                           time.strftime("%H:%M:%S", time.localtime(self.usage.good_ts))))
         else:
-            m.append(_item("暂无数据（获取中…）"))
+            m.append(_item(tr("暂无数据（获取中…）", "No data yet (fetching…)")))
         if self.usage.fail:
             err = (d or {}).get("error", "") if d else ""
-            m.append(_item(f"连续失败 {self.usage.fail} 次：{err[:60]}"))
+            m.append(_item(tr(f"连续失败 {self.usage.fail} 次：{err[:60]}",
+                              f"{self.usage.fail} consecutive failures: {err[:60]}")))
         m.append(Gtk.SeparatorMenuItem())
-        m.append(_item("显示 7 天窗口" if not self.show_7d else "显示 5 小时窗口",
+        m.append(_item(tr("显示 7 天窗口", "Show 7-day window") if not self.show_7d
+                       else tr("显示 5 小时窗口", "Show 5-hour window"),
                        self._toggle_window))
-        m.append(_item("立即刷新", self.refresh_usage))
-        m.append(_item("打开 Claude 用量页",
+        m.append(_item(tr("立即刷新", "Refresh now"), self.refresh_usage))
+        m.append(_item(tr("打开 Claude 用量页", "Open Claude usage page"),
                        lambda *_: webbrowser.open("https://claude.ai/settings/usage")))
         m.append(Gtk.SeparatorMenuItem())
         m.append(_autostart_item())
-        m.append(_item("退出", lambda *_: Gtk.main_quit()))
+        m.append(_item(tr("退出", "Quit"), lambda *_: Gtk.main_quit()))
         m.show_all()
         self.claude.set_menu(m)
 
@@ -353,7 +370,7 @@ class Tray:
         self.ipst.absorb(r)                   # 吸收：单次失败沿用上次盾牌，连败才变灰
         # 机房 IP 不点亮盾牌，仅在菜单里注明（与 mac/win 版一致）；ip_level 把
         # 连败/过期统一映射成灰（红只留给真的测出问题）
-        self.shield.set_icon_full(draw_shield(ip_level(self.ipst)), "IP 安全度")
+        self.shield.set_icon_full(draw_shield(ip_level(self.ipst)), tr("IP 安全度", "IP Security"))
         self._rebuild_shield_menu()
         return False
 
@@ -361,39 +378,42 @@ class Tray:
         m = Gtk.Menu()
         r = self.ipst.data
         if not r:
-            m.append(_item("检测中…"))
+            m.append(_item(tr("检测中…", "Checking…")))
         else:
             # 菜单头走 ip_level（连败/过期 → 灰），与盾牌图标一致；不能直接用
             # r["level"]，否则连败时图标是灰、菜单头却还写"有风险"，自相矛盾
             level = ip_level(self.ipst)
-            head = {ipsec.SHIELD_OK: "网络环境正常",
-                    ipsec.SHIELD_WARN: "需注意：出口 IP 有变化",
-                    ipsec.SHIELD_CRIT: "有风险",
-                    ipsec.SHIELD_IDLE: "未能完成检测"}[level]
+            head = {ipsec.SHIELD_OK:   tr("网络环境正常", "Network looks fine"),
+                    ipsec.SHIELD_WARN: tr("需注意：出口 IP 有变化", "Heads up: exit IP changed"),
+                    ipsec.SHIELD_CRIT: tr("有风险", "At risk"),
+                    ipsec.SHIELD_IDLE: tr("未能完成检测", "Check did not complete")}[level]
             m.append(_item(head))
             if r.get("ip"):
                 loc = " ".join(x for x in [r.get("country"), r.get("city")] if x)
-                m.append(_item(f"出口 IP：{r['ip']}  {loc}"))
+                m.append(_item(tr(f"出口 IP：{r['ip']}  {loc}", f"Exit IP: {r['ip']}  {loc}")))
             if r.get("isp"):
-                tags = [t for t, on in [("机房", r.get("is_datacenter")),
-                                        ("VPN", r.get("is_vpn")),
-                                        ("代理", r.get("is_proxy")),
-                                        ("Tor", r.get("is_tor")),
-                                        ("滥用源", r.get("is_abuser"))] if on]
-                m.append(_item(f"ISP：{r['isp']}" + ("  [" + "/".join(tags) + "]" if tags else "")))
+                tags = [t for t, on in [
+                    (tr("机房", "Datacenter"), r.get("is_datacenter")),
+                    ("VPN", r.get("is_vpn")),
+                    (tr("代理", "Proxy"), r.get("is_proxy")),
+                    ("Tor", r.get("is_tor")),
+                    (tr("滥用源", "Abuser"), r.get("is_abuser"))] if on]
+                m.append(_item(tr(f"ISP：{r['isp']}", f"ISP: {r['isp']}")
+                               + ("  [" + "/".join(tags) + "]" if tags else "")))
             if not r.get("reachable"):
-                m.append(_item("claude.ai 不可达"))
+                m.append(_item(tr("claude.ai 不可达", "claude.ai unreachable")))
             elif r.get("dns_leaked"):
-                m.append(_item("DNS 泄露：解析出口与 IP 出口国家不一致"))
+                m.append(_item(tr("DNS 泄露：解析出口与 IP 出口国家不一致",
+                                  "DNS leak: resolver country differs from exit IP")))
             elif r.get("dns_ok"):
-                m.append(_item("DNS 未泄露"))
+                m.append(_item(tr("DNS 未泄露", "No DNS leak")))
             if r.get("error"):
                 m.append(_item(str(r["error"])[:60]))
-            m.append(_item("WebRTC 需浏览器检测 →",
+            m.append(_item(tr("WebRTC 需浏览器检测 →", "WebRTC needs a browser →"),
                            lambda *_: webbrowser.open(ipsec.SITE_URL)))
         m.append(Gtk.SeparatorMenuItem())
-        m.append(_item("立即重新检测", self.refresh_ip))
-        m.append(_item("打开完整检测页面",
+        m.append(_item(tr("立即重新检测", "Re-check now"), self.refresh_ip))
+        m.append(_item(tr("打开完整检测页面", "Open full check page"),
                        lambda *_: webbrowser.open(ipsec.SITE_URL)))
         m.append(Gtk.SeparatorMenuItem())
         m.append(_autostart_item())

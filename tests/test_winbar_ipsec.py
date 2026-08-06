@@ -2,7 +2,9 @@
 """Windows 托盘版 IP 安全 UI 的离线单测——不联网、不起 GUI。
 
 覆盖三块：
-1. IPState.absorb 的抖动抑制（单次失败沿用 / 连败 3 次变灰 / 退避）
+1. ip_level(state) 把 quotacore 记账状态映射成盾牌档位（连败/过期 → 灰，
+   真判定 → 红/黄）。记账算法本身在 test_quotacore 里测，这里只测 winbar
+   的映射函数。
 2. 盾牌图标四种形状确实画得不一样（像素比对，防止改坏成只换色）
 3. 卡片/tooltip 文案的分支（降级、DNS 三态、滥用分抽取）
 
@@ -16,6 +18,7 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 import ipsec  # noqa: E402
+import quotacore  # noqa: E402
 
 # 托盘脚本文件名带连字符，不能直接 import，走 importlib。
 # 注意它会 import pystray 吗？——不会，pystray 只在 main() 里 import，
@@ -43,33 +46,39 @@ BAD = {"level": ipsec.SHIELD_CRIT, "error": "URLError: timed out"}
 
 
 def new_state(refresh=600):
-    return tray.IPState(lambda: refresh)
+    """IP 记账状态用 quotacore.make_ip_state（合并前是 winbar.IPState）。
+    盾牌档位映射用 winbar 的 tray.ip_level(state)——那是本文件的被测对象。"""
+    return quotacore.make_ip_state(lambda: refresh)
 
 
-print("\n【IPState 抖动抑制】")
+def lvl(state):
+    return tray.ip_level(state)
+
+
+print("\n【ip_level 映射：连败/过期 → 灰，其余按 probe 判定】")
 st = new_state()
-check("初始未检测 → 灰", st.level(), ipsec.SHIELD_IDLE)
+check("初始未检测 → 灰", lvl(st), ipsec.SHIELD_IDLE)
 
 st.absorb(GOOD)
-check("首次成功 → 绿", st.level(), ipsec.SHIELD_OK)
+check("首次成功 → 绿", lvl(st), ipsec.SHIELD_OK)
 check("成功不记失败", st.fail, 0)
 
 st.absorb(BAD)
-check("失败 1 次 → 仍绿（沿用）", st.level(), ipsec.SHIELD_OK)
+check("失败 1 次 → 仍绿（沿用）", lvl(st), ipsec.SHIELD_OK)
 check("失败 1 次 → 数据没被覆盖", st.data["ip"], "1.2.3.4")
 check("失败 1 次 → fail=1", st.fail, 1)
 
 st.absorb(BAD)
-check("失败 2 次 → 仍绿（沿用）", st.level(), ipsec.SHIELD_OK)
+check("失败 2 次 → 仍绿（沿用）", lvl(st), ipsec.SHIELD_OK)
 check("失败 2 次 → 不进退避", st.in_backoff(), False)
 
 st.absorb(BAD)
-check("失败 3 次 → 灰（不是红！）", st.level(), ipsec.SHIELD_IDLE)
+check("失败 3 次 → 灰（不是红！）", lvl(st), ipsec.SHIELD_IDLE)
 check("失败 3 次 → 进退避", st.in_backoff(), True)
 check("失败 3 次 → 数据落到失败结果", bool(st.data.get("error")), True)
 
 st.absorb(GOOD)
-check("恢复成功 → 绿", st.level(), ipsec.SHIELD_OK)
+check("恢复成功 → 绿", lvl(st), ipsec.SHIELD_OK)
 check("恢复成功 → 清空退避", st.in_backoff(), False)
 check("恢复成功 → 清空失败计数", st.fail, 0)
 
@@ -78,16 +87,16 @@ st = new_state()
 crit_err = {"level": ipsec.SHIELD_CRIT, "error": "URLError: unreachable"}
 for _ in range(3):
     st.absorb(crit_err)
-check("3 次不可达 → 灰而不是红", st.level(), ipsec.SHIELD_IDLE)
+check("3 次不可达 → 灰而不是红", lvl(st), ipsec.SHIELD_IDLE)
 
 print("\n【真的测出问题才给红】")
 st = new_state()
 st.absorb({"level": ipsec.SHIELD_CRIT, "error": None, "dns_leaked": True,
            "dns_ok": True, "dns_servers": [{"ip": "1.1.1.1", "country": "China"}]})
-check("检测成功且判定 crit → 红", st.level(), ipsec.SHIELD_CRIT)
+check("检测成功且判定 crit → 红", lvl(st), ipsec.SHIELD_CRIT)
 st2 = new_state()
 st2.absorb({"level": ipsec.SHIELD_WARN, "error": None, "ip_changed": True})
-check("检测成功且判定 warn → 黄", st2.level(), ipsec.SHIELD_WARN)
+check("检测成功且判定 warn → 黄", lvl(st2), ipsec.SHIELD_WARN)
 
 print("\n【degraded 不算失败】")
 st = new_state()
@@ -95,14 +104,14 @@ st.absorb(GOOD)
 st.absorb({"level": ipsec.SHIELD_OK, "error": None, "degraded": True, "ip": "9.9.9.9"})
 check("ip.net.coffee 挂了不记失败", st.fail, 0)
 check("degraded 仍采用新数据", st.data["ip"], "9.9.9.9")
-check("degraded 仍是绿", st.level(), ipsec.SHIELD_OK)
+check("degraded 仍是绿", lvl(st), ipsec.SHIELD_OK)
 
 print("\n【数据过期后不再沿用】")
 st = new_state()
 st.absorb(GOOD)
 st.good_ts -= tray._IPSEC_STALE_MAX_SEC + 1     # 伪造"上次好数据太老了"
 st.absorb(BAD)
-check("好数据过期 → 单次失败也变灰", st.level(), ipsec.SHIELD_IDLE)
+check("好数据过期 → 单次失败也变灰", lvl(st), ipsec.SHIELD_IDLE)
 
 print("\n【退避时长按 IP 自己的 10 分钟节奏】")
 st = new_state(refresh=600)
@@ -120,9 +129,9 @@ print("\n【None / 空输入不炸】")
 st = new_state()
 st.absorb(None)
 check("absorb(None) 无副作用", (st.fail, st.data), (0, None))
-check("空 data 仍是灰", st.level(), ipsec.SHIELD_IDLE)
+check("空 data 仍是灰", lvl(st), ipsec.SHIELD_IDLE)
 st.absorb({"error": None})           # 没 level 字段的畸形返回
-check("缺 level 字段 → 灰", st.level(), ipsec.SHIELD_IDLE)
+check("缺 level 字段 → 灰", lvl(st), ipsec.SHIELD_IDLE)
 
 print("\n【盾牌四种形状真的不同（像素比对）】")
 imgs = {lvl: tray.render_shield(lvl).convert("L").point(lambda v: 255 if v else 0)

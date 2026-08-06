@@ -121,5 +121,26 @@ check("with_dns=False 跳过 DNS 探针", called["n"], 0)
 
 ipsec.probe_trace, ipsec.probe_iprisk, ipsec.probe_geoip, ipsec.probe_dns = _orig
 
+print("\n【DNS 探针不污染全局 socket 超时（回归护栏）】")
+import socket as _sock, threading as _th
+_sock.setdefaulttimeout(30)                      # 模拟调用方设过别的超时
+ipsec._resolve_with_timeout("no-such-host.invalid")
+check("解析后还原调用方原值（不是清成 None）", _sock.getdefaulttimeout(), 30)
+_sock.setdefaulttimeout(None)
+ipsec._resolve_with_timeout("no-such-host.invalid")
+check("原值为 None 时也正确还原", _sock.getdefaulttimeout(), None)
+
+_errs = []
+def _hammer():
+    try:
+        for _ in range(3):
+            ipsec._resolve_with_timeout("no-such-host.invalid")
+    except Exception as e:
+        _errs.append(e)
+_ts = [_th.Thread(target=_hammer) for _ in range(4)]
+[t.start() for t in _ts]; [t.join() for t in _ts]
+check("4 线程并发解析无异常", len(_errs), 0)
+check("并发后无残留污染", _sock.getdefaulttimeout(), None)
+
 print("\n" + ("FAILED: " + ", ".join(FAILS) if FAILS else "ALL PASS"))
 sys.exit(1 if FAILS else 0)

@@ -185,7 +185,7 @@ ai-limit --detail     # 每个模型的详细 token 统计
 
 ### 说明
 
-- 浏览器 Cookie 读取仅支持 macOS（依赖 Keychain 解密），需要 Chrome/Firefox 已登录 claude.ai 和 chatgpt.com
+- 浏览器 Cookie 读取三端均支持（macOS 走 Keychain、Windows 走 DPAPI、Linux 走 GNOME Keyring / 直读 profile），需要 Chrome/Edge/Firefox 已登录 claude.ai 和 chatgpt.com；新版 Chrome/Edge 的 App-Bound Encryption 可能导致读不出，用 Firefox 最稳
 - 偶发 ⚠️ 多为 Cloudflare 临时拦截，fork 版的抖动抑制会吸收大部分；若 ⚠️ 持续不消，打开 [Claude 用量页](https://claude.ai/settings/usage) 并保持标签页不关
 - Claude 额度用的是 claude.ai 内部接口，非官方 API，可能随版本失效
 - `<synthetic>` 模型记录是 Claude Code 遇到 API 错误时写入的占位，不计入统计

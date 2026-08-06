@@ -159,7 +159,10 @@ def fmt_tokens(n: int) -> str:
 def fmt_plan(plan: str) -> str:
     if not plan or plan == "?":
         return "?"
-    return str(plan).replace("_", " ").title()
+    # 不用 str.title()：它把紧跟数字的字母也当词首，"max_20x" 会变成
+    # "Max 20X"（菜单栏版早已修过，CLI 这份一直漏着——同一个 bug 两处实现）
+    words = str(plan).replace("_", " ").split()
+    return " ".join(w[:1].upper() + w[1:] for w in words)
 
 
 def fmt_dt(dt: datetime.datetime) -> str:

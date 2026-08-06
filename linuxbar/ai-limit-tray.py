@@ -62,7 +62,10 @@ def _autostart_body() -> str:
         "Type=Application\n"
         "Name=AI Limit Tray\n"
         "Comment=Claude 额度 + IP 安全度托盘监控\n"
-        f"Exec={sys.executable} {pathlib.Path(__file__).resolve()}\n"
+        # 路径必须套引号：用户目录带空格/中文时，裸拼的 Exec 会在第一个空格处
+        # 截断，开机静默启动失败且毫无痕迹——winbar 版在注册表 Run 键上踩过
+        # 同一个坑（见其 autostart_command 注释）
+        f'Exec="{sys.executable}" "{pathlib.Path(__file__).resolve()}"\n'
         "X-GNOME-Autostart-enabled=true\n"
         "X-GNOME-Autostart-Delay=10\n"
     )
@@ -212,6 +215,7 @@ class Tray:
         self.ip = None              # 最近一次 ipsec.probe()
         self._fetching = False
         self._probing = False
+        self._usage_timer = None    # 已排定的下一次刷新（GLib source id）
 
         self._rebuild_claude_menu()
         self._rebuild_shield_menu()
@@ -221,13 +225,19 @@ class Tray:
 
     # ── Claude 用量 ─────────────────────────────────────────────
     def _schedule_next(self):
+        # 先取消已挂的下一次：刷新链是「fetch 完成 → 排下一次」自续的，手动
+        # 「立即刷新」会在旧链 timer 仍挂着时开出第二条链——每点一次，请求
+        # 频率就永久翻一倍，与低调采集原则直接冲突。单一 pending timer 是硬约束
+        if self._usage_timer is not None:
+            GLib.source_remove(self._usage_timer)
         delay = _REFRESH_SEC + random.randint(0, _JITTER_MAX_SEC)
-        if self.fails >= _FAIL_GRACE_N:      # 连败指数退避
-            delay = min(_REFRESH_SEC * (2 ** (self.fails - _FAIL_GRACE_N + 1)),
+        if self.fails >= _FAIL_GRACE_N:      # 连败指数退避（公式与 mac/win 版对齐）
+            delay = min(_REFRESH_SEC * (2 ** (self.fails - _FAIL_GRACE_N)),
                         _BACKOFF_MAX_SEC)
-        GLib.timeout_add_seconds(delay, self._usage_tick)
+        self._usage_timer = GLib.timeout_add_seconds(delay, self._usage_tick)
 
     def _usage_tick(self):
+        self._usage_timer = None              # 该 source 触发即自动销毁，别再 remove
         self.refresh_usage()
         return False                          # 单次 timer，回调里再排下一次
 

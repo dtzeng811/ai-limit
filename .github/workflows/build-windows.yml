@@ -33,6 +33,7 @@ jobs:
             --specpath winbar/build `
             --add-data "${{ github.workspace }}\usage.py;." `
             --add-data "${{ github.workspace }}\ipsec.py;." `
+            --add-data "${{ github.workspace }}\quotacore.py;." `
             --hidden-import pystray._win32 `
             winbar/ai-limit-tray.py
 

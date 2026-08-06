@@ -29,15 +29,14 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 import ipsec  # noqa: E402
+import quotacore  # noqa: E402  三端共享的行为核心（退避/刷新参数、品牌色）
 from usage import live_claude_usage, ts_to_local  # noqa: E402
 
-# ── 常量（与 menubar / winbar 版对齐） ──────────────────────────────────────
-_REFRESH_SEC     = 3 * 60
-_JITTER_MAX_SEC  = 20
-_FAIL_GRACE_N    = 3
-_STALE_MAX_SEC   = 15 * 60
-_BACKOFF_MAX_SEC = 30 * 60
-_IPSEC_SEC       = 10 * 60
+# ── 常量（引用 quotacore 单一来源，与 menubar / winbar 对齐） ────────────────
+# 连败/过期/退避阈值都封装在 AbsorbState 里了，本文件只需刷新间隔和抖动
+_REFRESH_SEC     = quotacore.REFRESH_SEC
+_JITTER_MAX_SEC  = quotacore.JITTER_MAX_SEC
+_IPSEC_SEC       = quotacore.IPSEC_REFRESH_SEC
 
 _CLAUDE_COLOR = (0xD9 / 255, 0x77 / 255, 0x57 / 255)
 _SHIELD_COLORS = {
@@ -162,6 +161,15 @@ def draw_shield(level: str) -> str:
     return name
 
 
+def ip_level(state) -> str:
+    """IP 盾牌档位。连败/过期一律映射成灰（红只留给真的测出问题）——与
+    winbar 的同名函数、设计文档第 4 节一致。"""
+    d = state.data
+    if not d or quotacore.ip_failed(d):
+        return ipsec.SHIELD_IDLE
+    return d.get("level") or ipsec.SHIELD_IDLE
+
+
 def _fmt_reset(iso: str | None) -> str:
     if not iso:
         return "—"
@@ -206,13 +214,12 @@ class Tray:
         self.shield.set_icon_theme_path(theme)
         self.shield.set_status(AppIndicator.IndicatorStatus.ACTIVE)
 
-        # 状态
-        self.data = None            # 最近一次成功的 usage
-        self.data_ts = 0.0
-        self.fails = 0
-        self.last_err = None
+        # 状态。额度与 IP 的失败记账都交给 quotacore.AbsorbState——单次失败沿用
+        # 上次好数据、连败 3 次才如实报错、连败后指数退避，与 mac/win 版逐字节
+        # 一致（此前 linuxbar 是手写 self.fails 计数，且 IP 侧根本没有吸收/退避）。
+        self.usage = quotacore.AbsorbState(lambda: _REFRESH_SEC)
+        self.ipst = quotacore.make_ip_state(lambda: _IPSEC_SEC)
         self.show_7d = False        # label 默认显示 5h 窗口
-        self.ip = None              # 最近一次 ipsec.probe()
         self._fetching = False
         self._probing = False
         self._usage_timer = None    # 已排定的下一次刷新（GLib source id）
@@ -230,11 +237,10 @@ class Tray:
         # 频率就永久翻一倍，与低调采集原则直接冲突。单一 pending timer 是硬约束
         if self._usage_timer is not None:
             GLib.source_remove(self._usage_timer)
-        delay = _REFRESH_SEC + random.randint(0, _JITTER_MAX_SEC)
-        if self.fails >= _FAIL_GRACE_N:      # 连败指数退避（公式与 mac/win 版对齐）
-            delay = min(_REFRESH_SEC * (2 ** (self.fails - _FAIL_GRACE_N)),
-                        _BACKOFF_MAX_SEC)
-        self._usage_timer = GLib.timeout_add_seconds(delay, self._usage_tick)
+        # 退避时长直接读 AbsorbState 算好的 backoff_until，不再本地重算公式
+        remain = self.usage.backoff_until - time.time()
+        delay = max(remain, 0) if remain > 0 else _REFRESH_SEC + random.randint(0, _JITTER_MAX_SEC)
+        self._usage_timer = GLib.timeout_add_seconds(int(delay), self._usage_tick)
 
     def _usage_tick(self):
         self._usage_timer = None              # 该 source 触发即自动销毁，别再 remove
@@ -264,27 +270,30 @@ class Tray:
 
     def _usage_ok(self, data):
         self._fetching = False
-        self.data, self.data_ts, self.fails, self.last_err = data, time.time(), 0, None
+        self.usage.absorb(data)              # 成功：吸收清账
         self._render_claude()
         self._schedule_next()
         return False
 
     def _usage_fail(self, err):
         self._fetching = False
-        self.fails += 1
-        self.last_err = err
+        self.usage.absorb({"error": err})    # 失败：AbsorbState 决定沿用还是报错
         self._render_claude()
         self._schedule_next()
         return False
 
     def _render_claude(self):
-        stale = self.data_ts and (time.time() - self.data_ts > _STALE_MAX_SEC)
-        bad = self.data is None or self.fails >= _FAIL_GRACE_N or stale
-        if self.data:
-            left = self.data["7d_left" if self.show_7d else "5h_left"]
+        d = self.usage.data
+        good = d and "error" not in d
+        # bad = 当前显示的是失败态（连败到阈值 / 过期后 absorb 已把 data 换成 error）
+        bad = not good
+        if good:
+            left = d["7d_left" if self.show_7d else "5h_left"]
+            # 额度告警和抓取失败共用符号会叠成 "15%⚠⚠"，语义还不同。分工：
+            # 数字后的符号只表额度高低（<20% ⚠ / <10% ‼），失败态另起一个括号标注
             mark = "" if left >= 20 else ("⚠" if left >= 10 else "‼")
             self.claude.set_icon_full(draw_ring(left), "Claude")
-            self.claude.set_label(f"{left}%{mark}" + ("⚠" if bad else ""), "100%⚠")
+            self.claude.set_label(f"{left}%{mark}", "100%")
         else:
             self.claude.set_icon_full(draw_ring(0), "Claude")
             self.claude.set_label("⚠", "100%")
@@ -292,15 +301,16 @@ class Tray:
 
     def _rebuild_claude_menu(self):
         m = Gtk.Menu()
-        if self.data:
-            d = self.data
+        d = self.usage.data
+        if d and "error" not in d:
             m.append(_item(f"Claude 5h 窗口：剩 {d['5h_left']}%  (重置 {_fmt_reset(d['5h_reset'])})"))
             m.append(_item(f"Claude 7d 窗口：剩 {d['7d_left']}%  (重置 {_fmt_reset(d['7d_reset'])})"))
-            m.append(_item("更新于 " + time.strftime("%H:%M:%S", time.localtime(self.data_ts))))
+            m.append(_item("更新于 " + time.strftime("%H:%M:%S", time.localtime(self.usage.good_ts))))
         else:
             m.append(_item("暂无数据（获取中…）"))
-        if self.fails:
-            m.append(_item(f"连续失败 {self.fails} 次：{(self.last_err or '')[:60]}"))
+        if self.usage.fail:
+            err = (d or {}).get("error", "") if d else ""
+            m.append(_item(f"连续失败 {self.usage.fail} 次：{err[:60]}"))
         m.append(Gtk.SeparatorMenuItem())
         m.append(_item("显示 7 天窗口" if not self.show_7d else "显示 5 小时窗口",
                        self._toggle_window))
@@ -319,8 +329,10 @@ class Tray:
 
     # ── IP 安全盾牌 ─────────────────────────────────────────────
     def _ip_tick(self):
-        self.refresh_ip()
-        return True                           # 固定周期
+        # 退避期内这一轮跳过（AbsorbState 已算好 backoff_until），不发请求
+        if not self.ipst.in_backoff():
+            self.refresh_ip()
+        return True                           # 固定周期 timer，退避靠跳过实现
 
     def refresh_ip(self, *_a):
         if self._probing:
@@ -338,20 +350,22 @@ class Tray:
 
     def _ip_done(self, r):
         self._probing = False
-        self.ip = r
-        level = r.get("level") or ipsec.SHIELD_IDLE
-        # 机房 IP 不点亮盾牌，仅在菜单里注明（与 mac/win 版一致）
-        self.shield.set_icon_full(draw_shield(level), "IP 安全度")
+        self.ipst.absorb(r)                   # 吸收：单次失败沿用上次盾牌，连败才变灰
+        # 机房 IP 不点亮盾牌，仅在菜单里注明（与 mac/win 版一致）；ip_level 把
+        # 连败/过期统一映射成灰（红只留给真的测出问题）
+        self.shield.set_icon_full(draw_shield(ip_level(self.ipst)), "IP 安全度")
         self._rebuild_shield_menu()
         return False
 
     def _rebuild_shield_menu(self):
         m = Gtk.Menu()
-        r = self.ip
+        r = self.ipst.data
         if not r:
             m.append(_item("检测中…"))
         else:
-            level = r.get("level") or ipsec.SHIELD_IDLE
+            # 菜单头走 ip_level（连败/过期 → 灰），与盾牌图标一致；不能直接用
+            # r["level"]，否则连败时图标是灰、菜单头却还写"有风险"，自相矛盾
+            level = ip_level(self.ipst)
             head = {ipsec.SHIELD_OK: "网络环境正常",
                     ipsec.SHIELD_WARN: "需注意：出口 IP 有变化",
                     ipsec.SHIELD_CRIT: "有风险",

@@ -9,7 +9,7 @@ if (-not (Test-Path ".venv-win")) {
 }
 & .venv-win\Scripts\pip.exe install -q -r winbar\requirements-win.txt pyinstaller
 
-# --onefile 单 exe；--noconsole 无黑窗；usage.py / ipsec.py 以数据文件塞进去由 sys.path 加载
+# --onefile 单 exe；--noconsole 无黑窗；usage/ipsec/quotacore 以数据文件塞进去由 sys.path 加载
 & .venv-win\Scripts\pyinstaller.exe --noconfirm --onefile --noconsole `
     --name ai-limit-tray `
     --distpath winbar\dist `
@@ -17,6 +17,7 @@ if (-not (Test-Path ".venv-win")) {
     --specpath winbar\build `
     --add-data "$PWD\usage.py;." `
     --add-data "$PWD\ipsec.py;." `
+    --add-data "$PWD\quotacore.py;." `
     --hidden-import pystray._win32 `
     winbar\ai-limit-tray.py
 

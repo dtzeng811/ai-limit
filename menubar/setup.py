@@ -22,7 +22,7 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "ai-limit.icns",
     "packages": ["rumps", "browser_cookie3", "Cryptodome"],
-    "includes": ["usage", "panelui"],  # panelui = fork 版新增的面板绘制模块，显式声明确保打包
+    "includes": ["usage", "ipsec", "quotacore", "panelui"],  # 显式声明仓库根的跨平台模块 + 面板绘制模块，确保打包
     "resources": ["ai-limit-updater.sh"],  # 一键更新 helper 脚本，随 App 一起签名封印
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示

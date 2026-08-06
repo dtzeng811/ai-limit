@@ -27,7 +27,6 @@
 """
 import ctypes
 import json
-import locale as _locale
 import os
 import pathlib
 import queue
@@ -48,6 +47,7 @@ else:
 sys.path.insert(0, str(_REPO))
 
 import ipsec  # noqa: E402  IP 安全度数据层（跨平台）
+import quotacore  # noqa: E402  三端共享的行为核心（抖动抑制/退避/常量）
 import usage  # noqa: E402  数据层（跨平台）
 from usage import (  # noqa: E402
     ClaudeWebError, CodexAuthError, CodexWebError,
@@ -58,28 +58,23 @@ from usage import (  # noqa: E402
 )
 
 
-def _window_shorthand(window_minutes):
-    """按窗口实际分钟数生成 "5h"/"7d" 短标签（移植自 menubar 版——那个文件
-    import rumps，Windows 上不能作为模块引用）。"""
-    if not window_minutes:
-        return None
-    hours = window_minutes / 60
-    if hours < 24:
-        return f"{round(hours) or 1}h"
-    return f"{round(hours / 24)}d"
+# 窗口短标签、退避/刷新参数、品牌色、套餐缓存、locale——全部下沉到 quotacore，
+# 三端共用同一份实现。下面保留旧的模块级名字作为别名，避免改动本文件里几十处
+# 已有的 _FAIL_GRACE_N / _window_shorthand 调用点。
+_window_shorthand = quotacore.window_shorthand
 
-# ── 常量（与 menubar/ai-limit-app.py 对齐） ──────────────────────────────────
+# ── 常量（引用 quotacore 单一来源） ──────────────────────────────────────────
 _STATE_PATH = pathlib.Path.home() / ".ai-limit-winbar.json"
 
-_DEFAULT_REFRESH_MIN = 3
-_JITTER_MAX_SEC      = 20
-_FAIL_GRACE_N        = 3
-_STALE_MAX_SEC       = 15 * 60
-_BACKOFF_MAX_SEC     = 30 * 60
-_PLAN_TTL_SEC        = 12 * 60 * 60
+_DEFAULT_REFRESH_MIN = quotacore.DEFAULT_REFRESH_MIN
+_JITTER_MAX_SEC      = quotacore.JITTER_MAX_SEC
+_FAIL_GRACE_N        = quotacore.FAIL_GRACE_N
+_STALE_MAX_SEC       = quotacore.STALE_MAX_SEC
+_BACKOFF_MAX_SEC     = quotacore.BACKOFF_MAX_SEC
+_PLAN_TTL_SEC        = quotacore.PLAN_TTL_SEC
 
-_SERVICE_COLORS = {"claude": "#D97757", "codex": "#10A37F"}
-_SERVICE_TITLES = {"claude": "Claude Code", "codex": "CodeX"}
+_SERVICE_COLORS = quotacore.SERVICE_COLORS
+_SERVICE_TITLES = quotacore.SERVICE_TITLES
 _BADGE_COLORS   = {"warn": "#F5C518", "crit": "#E04343"}
 
 _ICON_PX     = 64      # 高分画布，Windows 按 DPI 自行缩放
@@ -94,28 +89,11 @@ _SHIELD_COLORS = {
     ipsec.SHIELD_CRIT: "#E04343",
     ipsec.SHIELD_IDLE: "#8A8A8A",
 }
-# IP/DNS 状态不会分钟级变化，独立于额度的 3 分钟走 10 分钟一轮
-_IPSEC_REFRESH_SEC = 10 * 60
-# 沿用上次结果的过期上限。额度那边是 15 分钟（= 5 个 3 分钟周期），IP 这边一轮
-# 就是 10 分钟，用 15 分钟会让第 2 次失败就因"数据过期"变灰，抢在"连败 3 次"
-# 规则之前触发——所以按 IP 自己的节奏放宽到 4 轮
-_IPSEC_STALE_MAX_SEC = 4 * _IPSEC_REFRESH_SEC
+_IPSEC_REFRESH_SEC   = quotacore.IPSEC_REFRESH_SEC
+_IPSEC_STALE_MAX_SEC = quotacore.IPSEC_STALE_MAX_SEC
 
 
-def _detect_lang() -> str:
-    """Windows 中文系统 locale 名是 'Chinese (Simplified)_China'，不带 'zh'
-    前缀，usage._detect_lang 的 startswith('zh') 判不出来——这里补上。"""
-    env = os.environ.get("AI_LIMIT_LANG", "")
-    if env:
-        return "zh" if env.lower().startswith("zh") else "en"
-    try:
-        loc = _locale.getlocale()[0] or os.environ.get("LANG", "") or ""
-    except Exception:
-        loc = ""
-    return "zh" if (loc.lower().startswith("zh") or "chinese" in loc.lower()) else "en"
-
-
-LANG = _detect_lang()
+LANG = quotacore.detect_lang()
 
 
 def tr(zh: str, en: str) -> str:
@@ -286,113 +264,22 @@ def level_of(pct) -> str:
     return "ok"
 
 
-class ServiceState:
-    """单个服务的显示数据 + 失败记账。absorb() 的语义与 Mac 版 _absorb_fetch
-    一致：瞬时失败沿用好数据，连败/过期才如实报错，连败后指数退避。"""
-
-    def __init__(self, key: str, refresh_sec_fn):
-        self.key = key
-        self.data = None            # 显示用 dict（同 Mac 版 fetch 契约）
-        self.fail = 0
-        self.good_ts = 0.0
-        self.backoff_until = 0.0
-        self._refresh_sec = refresh_sec_fn
-
-    def absorb(self, new):
-        if new is None:
-            return
-        if "error" not in new:
-            self.fail = 0
-            self.good_ts = time.time()
-            self.backoff_until = 0.0
-            self.data = new
-            return
-        self.fail += 1
-        over = self.fail - _FAIL_GRACE_N
-        if over >= 0:
-            delay = min(self._refresh_sec() * (2 ** over), _BACKOFF_MAX_SEC)
-            self.backoff_until = time.time() + delay
-        has_good = bool(self.data) and "error" not in self.data
-        fresh = (time.time() - self.good_ts) <= _STALE_MAX_SEC
-        if has_good and fresh and self.fail < _FAIL_GRACE_N:
-            return                  # 吸收：沿用旧好数据
-        self.data = new
-
-    def in_backoff(self) -> bool:
-        return time.time() < self.backoff_until
-
-
-class IPState:
-    """IP 安全检测状态 + 失败记账。
-
-    抖动抑制的哲学与 ServiceState 一致（单次失败沿用上次好结果，连败/过期才
-    如实报，连败后指数退避），但**失败的呈现完全不同**：
-
-    额度抓不到就显示错误文本，用户一眼知道是"没读到"。盾牌只有一个形状位，
-    如果检测失败画成红盾，用户会以为"网络被判定为不安全"——那是最坏的误导。
-    所以这里失败一律落到**灰**（SHIELD_IDLE）：红留给真的测出问题，灰表示
-    没测到。这也是设计文档第 4 节写死的规则。
-    """
-
-    def __init__(self, refresh_sec_fn):
-        self.data = None            # ipsec.probe() 的返回
-        self.fail = 0
-        self.good_ts = 0.0
-        self.backoff_until = 0.0
-        self._refresh_sec = refresh_sec_fn
-
-    @staticmethod
-    def _failed(d) -> bool:
-        """probe() 只在整轮拿不到数据（trace 挂了）时置 error；ip.net.coffee
-        单独挂掉是 degraded=True，那仍然是一次成功的检测，不记失败。"""
-        return bool(d) and bool(d.get("error"))
-
-    def absorb(self, new):
-        if not new:
-            return
-        if not self._failed(new):
-            self.fail = 0
-            self.good_ts = time.time()
-            self.backoff_until = 0.0
-            self.data = new
-            return
-        self.fail += 1
-        over = self.fail - _FAIL_GRACE_N
-        if over >= 0:
-            delay = min(self._refresh_sec() * (2 ** over), _BACKOFF_MAX_SEC)
-            self.backoff_until = time.time() + delay
-        has_good = bool(self.data) and not self._failed(self.data)
-        fresh = (time.time() - self.good_ts) <= _IPSEC_STALE_MAX_SEC
-        if has_good and fresh and self.fail < _FAIL_GRACE_N:
-            return                  # 吸收：沿用上次好结果，盾牌不动
-        self.data = new
-
-    def in_backoff(self) -> bool:
-        return time.time() < self.backoff_until
-
-    def level(self) -> str:
-        """盾牌档位。注意 probe() 在 claude.ai 不可达时返回 level=crit，但走到
-        这里说明 absorb 已经判定为"连败/过期"——按上面的理由改判灰。"""
-        d = self.data
-        if not d or self._failed(d):
-            return ipsec.SHIELD_IDLE
-        return d.get("level") or ipsec.SHIELD_IDLE
+# 额度与 IP 的失败记账都用 quotacore.AbsorbState（合并前是本文件的 ServiceState /
+# IPState 两个类，语义完全一致，只差 stale 上限和 failed 判定）。
+# 构造走 quotacore：额度用默认，IP 用 make_ip_state（40 分钟过期 + degraded 不算失败）。
+def ip_level(state) -> str:
+    """IP 盾牌档位。probe() 在 claude.ai 不可达时返回 level=crit，但只要 absorb
+    判定成失败态（连败/过期），一律改判灰——红留给"真的测出问题"，灰表示
+    "没测到"。这条是设计文档第 4 节写死的规则，从 IPState.level() 抽出来。"""
+    d = state.data
+    if not d or quotacore.ip_failed(d):
+        return ipsec.SHIELD_IDLE
+    return d.get("level") or ipsec.SHIELD_IDLE
 
 
 # ── 数据抓取（镜像 menubar 的 fetch 契约） ───────────────────────────────────
-_plan_cache = {"plan": None, "ts": 0.0}
-
-
 def _cached_claude_plan():
-    now = time.time()
-    if now - _plan_cache["ts"] < _PLAN_TTL_SEC:
-        return _plan_cache["plan"]
-    try:
-        plan = live_claude_plan()
-        _plan_cache.update({"plan": plan, "ts": now})
-        return plan
-    except Exception:
-        return _plan_cache["plan"]
+    return quotacore.cached_claude_plan(live_claude_plan)
 
 
 def fetch_claude():
@@ -572,7 +459,7 @@ def _fmt_reset(val) -> str:
         return "?"
 
 
-def make_tooltip(service: str, st: ServiceState, mode: str) -> str:
+def make_tooltip(service: str, st, mode: str) -> str:
     """托盘悬浮文本（Windows 上限 128 字符）。首行 = 当前主窗口的值。"""
     title = _SERVICE_TITLES[service]
     d = st.data
@@ -667,7 +554,7 @@ def make_ip_tooltip(ip_state) -> str:
         second = f"{d.get('ip') or '?'}" + (f" · {loc}" if loc else "")
         if d.get("degraded"):
             second += tr(" · 风险数据不可用", " · risk data unavailable")
-        return f"{head} {ip_level_word(ip_state.level())}\n{second}"[:127]
+        return f"{head} {ip_level_word(ip_level(ip_state))}\n{second}"[:127]
     # 连败落到这里：说的是"没测到"，不是"测到问题"——措辞不能像告警
     return f"{head} · {tr('检测不可用', 'check unavailable')}\n{d.get('error') or ''}"[:127]
 
@@ -849,7 +736,7 @@ class Flyout:
         c.create_rectangle(x0, y0, x1, y1, fill=card_bg, width=0)
         self._ip_rect = (x0, y0, x1, y1)
 
-        lvl = self.ip_state.level()
+        lvl = ip_level(self.ip_state)
         accent = _SHIELD_COLORS.get(lvl, _SHIELD_COLORS[ipsec.SHIELD_IDLE])
         d = self.ip_state.data or {}
 
@@ -1075,8 +962,8 @@ def main():
     wake_evt = threading.Event()   # 手动刷新时打断休眠
     ip_force = threading.Event()   # 盾牌菜单的「立即刷新」跳过 10 分钟节流
     refresh_sec = lambda: state["refresh_min"] * 60
-    states = {k: ServiceState(k, refresh_sec) for k in ("claude", "codex")}
-    ip_state = IPState(lambda: _IPSEC_REFRESH_SEC)
+    states = {k: quotacore.AbsorbState(refresh_sec) for k in ("claude", "codex")}
+    ip_state = quotacore.make_ip_state(lambda: _IPSEC_REFRESH_SEC)
 
     root = tk.Tk()
     root.withdraw()
@@ -1104,7 +991,7 @@ def main():
     def repaint_shield():
         if shield is None:
             return
-        shield.icon = render_shield(ip_state.level())
+        shield.icon = render_shield(ip_level(ip_state))
         shield.title = make_ip_tooltip(ip_state)
 
     # ── 抓取线程：jitter + 退避跳过 + absorb，然后重画图标 ──

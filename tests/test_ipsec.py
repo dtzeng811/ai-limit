@@ -21,8 +21,16 @@ def check(name, got, want):
 
 
 US = {"country": "United States", "is_abuser": False}
-CN_DNS = [{"ip": "114.114.114.114", "country": "China"}]
-US_DNS = [{"ip": "8.8.8.8", "country": "United States"}]
+# ⚠️ 接口实际返回的是**纯 IP 字符串数组**（实测 ["162.158.185.30", ...]），
+# 不是带国家的 dict。早期这里用自己编的 dict 结构测，于是"测试全绿但线上
+# 一遇到非空 dns_servers 就崩"。下面两组用真实形态，国家靠打桩 geoip 补查。
+CN_DNS = ["114.114.114.114"]
+US_DNS = ["8.8.8.8"]
+_GEO = {"114.114.114.114": {"country": "China"},
+        "8.8.8.8": {"country": "United States"},
+        "1.1.1.1": {"country": "China"}}
+_real_geoip = ipsec.probe_geoip
+ipsec.probe_geoip = lambda ip, *a, **k: _GEO.get(ip)
 
 print("\n【判定表】")
 check("不可达 → 红", ipsec.decide(
@@ -62,10 +70,19 @@ check("异国 → 泄露", ipsec.is_dns_leaked(US, True, CN_DNS), True)
 check("同国 → 不泄露", ipsec.is_dns_leaked(US, True, US_DNS), False)
 check("空列表 → 不泄露", ipsec.is_dns_leaked(US, True, []), False)
 check("探针失败 → 不泄露", ipsec.is_dns_leaked(US, False, CN_DNS), False)
-check("country_name 字段兼容", ipsec.is_dns_leaked(
+check("dict 形态仍兼容(country_name)", ipsec.is_dns_leaked(
     US, True, [{"ip": "1.1.1.1", "country_name": "China"}]), True)
+check("字符串形态(真实结构)→ 查 geoip 判国", ipsec.is_dns_leaked(US, True, CN_DNS), True)
+check("dns_server_ip 取字符串", ipsec.dns_server_ip("8.8.8.8"), "8.8.8.8")
+check("dns_server_ip 取 dict", ipsec.dns_server_ip({"ip": "1.2.3.4"}), "1.2.3.4")
+check("dns_server_ip 容 None", ipsec.dns_server_ip(None), "")
+check("本机国家未知 → 不判泄露(宁漏勿误)",
+      ipsec.is_dns_leaked({"country": None}, True, CN_DNS), False)
+check("geoip 查不到国家 → 不判泄露",
+      ipsec.is_dns_leaked(US, True, ["203.0.113.9"]), False)
 check("大小写/空格不敏感", ipsec.is_dns_leaked(
     {"country": " united states "}, True, [{"ip": "8.8.8.8", "country": "UNITED STATES"}]), False)
+ipsec.probe_geoip = _real_geoip
 
 print("\n【probe() 降级路径（打桩，不联网）】")
 _orig = (ipsec.probe_trace, ipsec.probe_iprisk, ipsec.probe_geoip, ipsec.probe_dns)

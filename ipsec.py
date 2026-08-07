@@ -167,25 +167,55 @@ def decide(*, reachable, risk, dns_ok, dns_servers, ip_changed):
         return SHIELD_CRIT
     if risk and risk.get("is_abuser"):
         return SHIELD_CRIT
-    # DNS 泄露：拿到了 DNS 出口，且国家与出口 IP 不一致
-    if dns_ok and dns_servers:
-        home = _norm_country(risk.get("country") if risk else None)
-        for s in dns_servers:
-            c = _norm_country(s.get("country") or s.get("country_name"))
-            if home and c and c != home:
-                return SHIELD_CRIT
+    if dns_ok and is_dns_leaked(risk, dns_ok, dns_servers):
+        return SHIELD_CRIT
     if ip_changed:
         return SHIELD_WARN
     return SHIELD_OK
 
 
+def dns_server_ip(s):
+    """从一条 dns_servers 记录里取出 IP。
+
+    /api/dns/result 实际返回的是**纯 IP 字符串数组**（实测
+    `["162.158.185.30", ...]`），不带国家信息。这里同时兼容 dict 形态，
+    因为该站没有公开 API 文档、返回结构随时可能变——早期版本按 dict 假设
+    写死 s.get()，一旦 DNS 真的走公网（非空数组）就直接抛
+    AttributeError，整个 probe() 崩掉。
+    """
+    if isinstance(s, dict):
+        return s.get("ip") or s.get("address") or ""
+    return str(s or "")
+
+
+def dns_server_country(s, lookup=True):
+    """取这条 DNS 出口的国家。字符串形态没有国家字段，用 geoip 接口补查；
+    查不到返回空串（判定层会跳过——拿不准就不报泄露，避免误判）。"""
+    if isinstance(s, dict):
+        c = s.get("country") or s.get("country_name")
+        if c:
+            return _norm_country(c)
+    ip = dns_server_ip(s)
+    if not ip or not lookup:
+        return ""
+    geo = probe_geoip(ip)
+    return _norm_country((geo or {}).get("country"))
+
+
 def is_dns_leaked(risk, dns_ok, dns_servers):
+    """DNS 出口国家 ≠ 出口 IP 国家 → 泄露。
+
+    两侧任一国家取不到就**不判泄露**：宁可漏报也不误报——把用户的正常
+    网络标成红色泄露，比不报更糟。
+    """
     if not (dns_ok and dns_servers):
         return False
     home = _norm_country(risk.get("country") if risk else None)
+    if not home:
+        return False
     for s in dns_servers:
-        c = _norm_country(s.get("country") or s.get("country_name"))
-        if home and c and c != home:
+        c = dns_server_country(s)
+        if c and c != home:
             return True
     return False
 

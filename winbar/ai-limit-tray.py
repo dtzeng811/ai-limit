@@ -530,7 +530,9 @@ def ip_dns_text(d):
     - dns_ok=False      → 本轮没测到，既不能报安全也不能报泄露
     """
     if d.get("dns_leaked"):
-        names = [s.get("country") or s.get("country_name") or "?"
+        # dns_servers 实际是纯 IP 字符串数组，国家要另查——统一走 ipsec 的
+        # 归一化取值（早期这里按 dict 假设写 s.get()，非空时直接抛异常）
+        names = [(ipsec.dns_server_country(s) or "?").title()
                  for s in (d.get("dns_servers") or [])]
         # 只报出口在哪国——"与本机不同国"这层意思由红色 + 泄露标签承担，
         # 一行 190px 塞不下完整句子

@@ -34,7 +34,7 @@ OPTIONS = {
         # 不能带 +fork 后缀（macOS 会拒绝），fork 标识放在 ShortVersionString。
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit.fork",
         "CFBundleVersion": "0.3.23",
-        "CFBundleShortVersionString": "0.3.23-fork.6",
+        "CFBundleShortVersionString": "0.3.23-fork.7",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

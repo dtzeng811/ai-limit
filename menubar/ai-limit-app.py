@@ -547,8 +547,10 @@ def _ip_card_rows(data, lang):
     if not data.get("dns_ok"):
         parts = [{"t": "text", "s": _tr(lang, "不可用", "Unavailable"), "dim": True}]
     elif data.get("dns_leaked"):
+        # dns_servers 实际是纯 IP 字符串数组，国家要另查——统一走 ipsec 的
+        # 归一化取值（早期这里按 dict 假设写 s.get()，非空时直接抛异常）
         where = ", ".join(sorted({
-            str(s.get("country") or s.get("country_name") or "?")
+            (ipsec.dns_server_country(s) or "?").title()
             for s in data.get("dns_servers") or []
         }))
         parts = [{"t": "text", "s": _tr(lang, f"出口在 {where}", f"Exits in {where}")},

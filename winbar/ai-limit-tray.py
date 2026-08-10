@@ -94,6 +94,7 @@ _IPSEC_STALE_MAX_SEC = quotacore.IPSEC_STALE_MAX_SEC
 
 
 LANG = quotacore.detect_lang()
+usage.set_lang(LANG)   # 数据层的 POSIX locale 判定在 GUI 进程里不可靠，同步过去
 
 
 def tr(zh: str, en: str) -> str:
@@ -325,9 +326,9 @@ def fetch_codex():
             "7d_label": _window_shorthand(long_win.get("window_minutes")) if long_win else "7d",
             "plan":     rl.get("plan_type") or "?",
         }
-    except CodexAuthError:
-        return {"error": tr("无 Codex 权限（可能未订阅或需重新登录）",
-                            "No Codex access (subscription or re-login needed)")}
+    except CodexAuthError as e:
+        # 透传数据层的具体原因（已区分「登录态过期」与「无订阅」，自带 i18n）
+        return {"error": str(e)}
     except CodexWebError as e:
         msg = str(e)
         if "timed out" in msg or "urlopen" in msg:

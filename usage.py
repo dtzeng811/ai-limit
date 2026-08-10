@@ -29,7 +29,7 @@ _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 _MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.23+fork.7"
+__version__ = "0.3.23+fork.8"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -101,6 +101,19 @@ def _detect_lang() -> str:
 
 
 LANG = _detect_lang()
+
+
+def set_lang(lang: str) -> None:
+    """让 GUI 端把自己判定的语言注入进来。
+
+    必要性：打包成 .app / .exe 后是 GUI 进程，通常没有 POSIX LANG 环境变量，
+    _detect_lang() 会恒定落到 "en"。而 GUI 端有更准的来源（macOS 走 NSLocale，
+    且用户还能在菜单里手动选），所以由它们在启动和切换语言时同步过来——否则
+    菜单栏明明是中文，从数据层透传上来的错误文案却是英文。
+    """
+    global LANG
+    if lang in ("zh", "en"):
+        LANG = lang
 
 
 def t(zh: str, en: str) -> str:
@@ -834,10 +847,25 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                     token, from_cache = _cached_chatgpt_token(
                         cookie_header, timeout, force_refresh=True)
                     continue
+                # 服务端会在 body 里给出具体 code（token_expired / …）。之前
+                # 401/403 一律报「未登录或无 Codex 权限（可能未订阅）」，把
+                # 「登录态过期、重新登录即可」和「根本没订阅」混为一谈——
+                # 用户看到会先怀疑订阅或工具本身，而不是去重新登录。
+                code = ""
+                try:
+                    code = (json.loads(e.read() or b"{}")
+                            .get("detail", {}).get("code") or "")
+                except Exception:
+                    pass
+                if code == "token_expired" or e.code == 401:
+                    raise CodexAuthError(t(
+                        "ChatGPT 登录态已过期，请在浏览器重新登录 chatgpt.com",
+                        "ChatGPT session expired — sign in again at chatgpt.com",
+                    ))
                 raise CodexAuthError(
                     t(
-                        f"HTTP {e.code}：未登录 ChatGPT 或无 Codex 权限（可能未订阅，或需重新登录）",
-                        f"HTTP {e.code}: not signed in to ChatGPT or no Codex access (subscription may be required)",
+                        f"HTTP {e.code}：无 Codex 权限（可能未订阅，或需重新登录）",
+                        f"HTTP {e.code}: no Codex access (subscription may be required)",
                     )
                 )
             raise CodexWebError(f"HTTP {e.code}")

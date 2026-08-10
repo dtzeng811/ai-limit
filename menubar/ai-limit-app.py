@@ -824,10 +824,11 @@ def _fetch_codex(lang):
             "7d_label": _window_shorthand(long_win.get("window_minutes")) if long_win else "7d",
             "plan":     rl.get("plan_type") or "?",
         }
-    except CodexAuthError:
-        return {"error": _tr(lang,
-            "无 Codex 权限（可能未订阅或需重新登录）",
-            "No Codex access (subscription required or re-login needed)")}
+    except CodexAuthError as e:
+        # 透传数据层的具体原因（它已区分「登录态过期」与「无订阅」，且自带
+        # i18n）。此前这里硬编码一句笼统文案，把服务端明确给出的
+        # token_expired 也说成「可能未订阅」，用户会先去查订阅而不是重新登录。
+        return {"error": str(e)}
     except CodexWebError as e:
         msg = str(e)
         if "timed out" in msg or "urlopen" in msg:
@@ -1283,7 +1284,11 @@ class AiLimitApp(rumps.App):
         选"跟随系统"（或旧状态文件没有该字段）则每次启动按 NSLocale 实时判定——
         不把检测结果写回 state，避免被其他偏好的保存操作连带固化成"伪用户选择"。"""
         choice = self._state["lang"]
-        return choice if choice in ("zh", "en") else _SYSTEM_LANG
+        lang = choice if choice in ("zh", "en") else _SYSTEM_LANG
+        # 同步给数据层：它的 POSIX locale 判定在 GUI 进程里恒为 en，会让透传
+        # 上来的错误文案不跟随菜单栏语言（见 usage.set_lang 注释）
+        usage.set_lang(lang)
+        return lang
 
     # ── 菜单构建 ──────────────────────────────────────────────────────────────
 

@@ -30,6 +30,7 @@ sys.path.insert(0, str(_ROOT))
 
 import ipsec  # noqa: E402
 import quotacore  # noqa: E402  三端共享的行为核心（退避/刷新参数、品牌色）
+import usage  # noqa: E402  数据层（跨平台）
 from usage import live_claude_usage, ts_to_local  # noqa: E402
 
 # ── 常量（引用 quotacore 单一来源，与 menubar / winbar 对齐） ────────────────
@@ -164,6 +165,7 @@ def draw_shield(level: str) -> str:
 # i18n：与 winbar 同名同签名的 tr()，语言判定共用 quotacore.detect_lang
 # （原先 linuxbar 界面全是硬编码中文，英文环境的用户会看到一整套中文菜单）
 LANG = quotacore.detect_lang()
+usage.set_lang(LANG)   # 数据层的 POSIX locale 判定在 GUI 进程里不可靠，同步过去
 
 
 def tr(zh: str, en: str) -> str:

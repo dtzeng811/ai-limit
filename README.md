@@ -18,6 +18,8 @@
 
 左键点击弹出卡片式面板：环形进度 + 大号百分比 + 重置时间 + 服务健康状态点（数据来自官方 status page）。设置项都在面板下方的菜单里。
 
+Claude 卡片在 5h / 7d 之外还有第三行：**按模型限定的周期额度**（上图的 Fable 行）——这一档在 claude.ai 用量页看得到，但一般的菜单栏工具不显示。标签用服务端下发的模型名，旗舰换代时自动跟随，无需升级 App。目前 macOS 面板已支持，Windows flyout 下个版本跟进。
+
 <table><tr>
   <td><img src="docs/screenshot-panel-light.png" width="300" /></td>
   <td><img src="docs/screenshot-panel-dark.png" width="300" /></td>

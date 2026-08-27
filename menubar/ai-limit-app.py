@@ -26,6 +26,7 @@ import panelui
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+import usage   # 模块本体也要引入：_lang()/_fetch_claude 走 usage.xxx 访问
 from usage import (
     __version__,
     live_claude_plan,
@@ -785,6 +786,7 @@ def _fetch_claude(lang):
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
+            "scoped":   usage.parse_scoped_limits(data),
             "plan":     plan,
         }
     except ClaudeWebError as e:
@@ -1578,6 +1580,17 @@ class AiLimitApp(rumps.App):
                         "pct": pct,
                         "level": _ring_level(pct) if pct is not None else None,
                         "reset": fmt_reset(data.get(reset_key), lang) if data.get(reset_key) else None,
+                    })
+                # 按模型限定的周期额度（服务端 weekly_scoped；当前=Fable 的
+                # 周配额）：跟在 5h/7d 后面，标签用服务端下发的模型名。
+                # CodeX 数据没有 scoped 键，此循环自然空转
+                for sc in data.get("scoped") or []:
+                    pct = sc.get("left")
+                    card["rows"].append({
+                        "label": sc.get("label") or "?",
+                        "pct": pct,
+                        "level": _ring_level(pct) if pct is not None else None,
+                        "reset": fmt_reset(sc.get("reset"), lang) if sc.get("reset") else None,
                     })
             else:
                 card["error"] = _tr(lang, "读取中…", "Loading…")

@@ -350,8 +350,15 @@ class PanelView(AppKit.NSView):
 
         # ── 数据行：环 · 窗口 · 大数字 · 重置 ──────────────────────
         brand = color_from_hex(card.get("brand") or "#888888")
+        # 大数字列的横向偏移按本卡**最宽**的窗口标签算：只有 "5h"/"7d" 时维持
+        # 原 30pt；出现 "Fable" 这类模型名标签时整卡一起右移——数字列必须
+        # 纵向对齐，逐行自适应会把主角（百分比）排成锯齿
+        label_w = max((_attr(r["label"], 10.5, AppKit.NSFontWeightMedium,
+                             AppKit.NSColor.secondaryLabelColor(), mono=True)
+                       .size().width for r in card["rows"]), default=0.0)
+        num_off = max(30.0, label_w + 13.0)
         for row in card["rows"]:
-            self._draw_row(row, x_l, x_r, y, brand)
+            self._draw_row(row, x_l, x_r, y, brand, num_off)
             y += ROW_H
 
     def _draw_ip_card(self, card, top):
@@ -394,7 +401,7 @@ class PanelView(AppKit.NSView):
                 break
             x += w + PART_GAP
 
-    def _draw_row(self, row, x_l, x_r, y, brand):
+    def _draw_row(self, row, x_l, x_r, y, brand, num_off=30.0):
         pct = row.get("pct")
         num_color = _num_color(row.get("level"))
         cy = y + ROW_H / 2 - 2
@@ -421,7 +428,7 @@ class PanelView(AppKit.NSView):
         num = _attr(txt, 15, AppKit.NSFontWeightSemibold,
                     num_color if pct is not None else AppKit.NSColor.tertiaryLabelColor(),
                     mono=True)
-        num_x = x_l + RING_R * 2 + 30
+        num_x = x_l + RING_R * 2 + num_off
         num.drawAtPoint_(NSMakePoint(num_x, y + 0.5))
         if pct is not None:
             _attr("%", 9.5, color=num_color.colorWithAlphaComponent_(0.7)).drawAtPoint_(

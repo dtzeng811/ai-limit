@@ -29,7 +29,7 @@ _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 _MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.23+fork.8"
+__version__ = "0.3.23+fork.9"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -420,6 +420,39 @@ def live_claude_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict:
         headers,
         timeout,
     )
+
+
+def parse_scoped_limits(data) -> list:
+    """从 usage 返回的 limits 数组里取按模型限定的周期额度。
+
+    2026-08 实测结构（真实返回，勿凭记忆改）：
+
+        {"kind": "weekly_scoped", "percent": 33,
+         "resets_at": "2026-08-28T09:59:59+00:00",
+         "scope": {"model": {"id": null, "display_name": "Fable"}, ...}}
+
+    percent 是**已用**百分比；display_name 由服务端下发（当前旗舰=Fable），
+    换代时标签自动跟随，不在本地写死模型名。字段缺失/非数值的条目整条跳过
+    ——宁可少一行也不显示错的数。返回：
+        [{"label": "Fable", "left": 67, "reset": "<iso>|None"}]
+    """
+    out = []
+    for lim in (data.get("limits") or []) if isinstance(data, dict) else []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        pct = lim.get("percent")
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            continue
+        model = ((lim.get("scope") or {}).get("model") or {})
+        label = model.get("display_name") or model.get("id")
+        if not label:
+            continue
+        out.append({"label": str(label),
+                    # 夹到 [0,100]：服务端超发（percent>100）时显示 0 剩余，
+                    # 不显示负数
+                    "left": max(0, min(100, int(round(100 - float(pct))))),
+                    "reset": lim.get("resets_at")})
+    return out
 
 
 def live_claude_plan(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> str | None:

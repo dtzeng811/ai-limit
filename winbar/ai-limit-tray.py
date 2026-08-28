@@ -283,7 +283,23 @@ def _cached_claude_plan():
     return quotacore.cached_claude_plan(live_claude_plan)
 
 
+def _autotest_fake() -> bool:
+    """无人值守 UI 验证开关：VM 里没有浏览器登录态，抓不到真数据，flyout
+    会一直显示错误卡——布局改动就无从截屏验证。设 AI_LIMIT_AUTOTEST_FAKE=1
+    时两个 fetch 返回固定夹具（含 scoped 行），只为让 UI 有东西可画。
+    strip()：cmd 的 set X=1 && 会把空格算进值（见 AUTOTEST_FLYOUT 注释）。"""
+    return os.environ.get("AI_LIMIT_AUTOTEST_FAKE", "").strip() == "1"
+
+
 def fetch_claude():
+    if _autotest_fake():
+        return {"5h_left": 88, "7d_left": 52,
+                "5h_reset": "2026-08-27T05:00:00+00:00",
+                "7d_reset": "2026-08-28T10:00:00+00:00",
+                "5h_label": "5h", "7d_label": "7d",
+                "scoped": [{"label": "Fable", "left": 67,
+                            "reset": "2026-08-28T10:00:00+00:00"}],
+                "plan": "Max"}
     import socket, urllib.error
     try:
         data = live_claude_usage()
@@ -295,6 +311,7 @@ def fetch_claude():
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
             "5h_label": "5h", "7d_label": "7d",
+            "scoped":   usage.parse_scoped_limits(data),
             "plan":     _cached_claude_plan(),
         }
     except ClaudeWebError as e:
@@ -313,6 +330,10 @@ def fetch_claude():
 
 
 def fetch_codex():
+    if _autotest_fake():
+        return {"5h_left": 99, "7d_left": 31,
+                "5h_reset": 1787000000, "7d_reset": 1787400000,
+                "5h_label": "5h", "7d_label": "7d", "plan": "Pro"}
     import socket, urllib.error
     try:
         _ts, rl = live_codex_web_usage()
@@ -460,6 +481,15 @@ def _fmt_reset(val) -> str:
         return "?"
 
 
+_FLY_ROW_H = 30   # flyout 里一行（环+数字+重置）的行距
+
+
+def svc_card_h(data) -> int:
+    """服务卡高度：基础 96px 容两行（5h/7d），每条模型限定周期额度
+    （scoped，当前=Fable）再加一行。CodeX 数据没有 scoped 键，恒为基础高。"""
+    return 96 + _FLY_ROW_H * len((data or {}).get("scoped") or [])
+
+
 def make_tooltip(service: str, st, mode: str) -> str:
     """托盘悬浮文本（Windows 上限 128 字符）。首行 = 当前主窗口的值。"""
     title = _SERVICE_TITLES[service]
@@ -477,8 +507,13 @@ def make_tooltip(service: str, st, mode: str) -> str:
             parts.append(f"{label} ?")
         else:
             parts.append(f"{label} {pct}%（{tr('重置', 'resets')} {_fmt_reset(d.get(f'{key}_reset'))}）")
+    for sc in d.get("scoped") or []:
+        pct = sc.get("left")
+        parts.append(f"{sc.get('label') or '?'} ?" if pct is None else
+                     f"{sc.get('label')} {pct}%（{tr('重置', 'resets')} {_fmt_reset(sc.get('reset'))}）")
     stale = f" ·{tr('重试中', 'retrying')}" if st.fail > 0 else ""
-    return f"{title} {parts[0]}\n{parts[1]}{stale}"[:127]
+    body = "\n".join(parts[1:])
+    return f"{title} {parts[0]}\n{body}{stale}"[:127]
 
 
 # ── IP 安全卡片文案（判定在 ipsec，i18n 与格式化留在各端 UI 层） ─────────────
@@ -572,7 +607,7 @@ class Flyout:
     的答案，点进网页才是完整检测，所以卡片本身就是那个入口。
     """
 
-    W, CARD_H, IP_CARD_H, PAD = 300, 96, 112, 10
+    W, CARD_H, IP_CARD_H, PAD = 300, 96, 112, 10   # CARD_H=基础两行,加行走 svc_card_h
 
     def __init__(self, root, states: dict, state: dict, ip_state=None):
         self.root = root
@@ -610,7 +645,8 @@ class Flyout:
         card  = "#2B2B2B" if dark else "#FFFFFF"
         fg    = "#FFFFFF" if dark else "#1A1A1A"
         sub   = "#9E9E9E" if dark else "#6E6E6E"
-        h = self.PAD + len(self.states) * (self.CARD_H + self.PAD) + 24
+        h = self.PAD + sum(svc_card_h(self.states[s].data) + self.PAD
+                              for s in self.states) + 24
         if self.ip_state is not None:
             h += self.IP_CARD_H + self.PAD
 
@@ -649,7 +685,7 @@ class Flyout:
         for svc in ("claude", "codex"):
             st = self.states[svc]
             self._card(svc, st, mode, y0, card, fg, sub, f_title, f_big, f_sub)
-            y0 += self.CARD_H + self.PAD
+            y0 += svc_card_h(st.data) + self.PAD
 
         self._ip_rect = None
         self._ip_hover = False
@@ -689,10 +725,10 @@ class Flyout:
     def _card(self, svc, st, mode, y0, card_bg, fg, sub, f_title, f_big, f_sub):
         c = self.canvas
         x0, x1 = self.PAD, self.W - self.PAD
-        y1 = y0 + self.CARD_H
+        d = st.data or {}
+        y1 = y0 + svc_card_h(st.data)
         c.create_rectangle(x0, y0, x1, y1, fill=card_bg, width=0)
         color = _SERVICE_COLORS[svc]
-        d = st.data or {}
 
         title = _SERVICE_TITLES[svc]
         plan = (d.get("plan") or "").replace("_", " ")
@@ -713,10 +749,12 @@ class Flyout:
 
         first, second = ("5h", "7d") if mode == "5h" else ("7d", "5h")
         ry = y0 + 34
-        for key in (first, second):
-            pct = d.get(f"{key}_left")
-            label = d.get(f"{key}_label") or key
-            # 小环
+        # 数字列整卡统一：有 scoped 行（"Fable" 标签比 "5h" 宽）就整体右移，
+        # 与 mac 版 panelui 同一取舍——逐行自适应会把主角（百分比）排成锯齿
+        num_x = 96 if d.get("scoped") else 78
+
+        def draw_row(label, pct, reset_val):
+            nonlocal ry
             bx = [x0 + 14, ry, x0 + 14 + 22, ry + 22]
             c.create_oval(bx, outline=self._alpha(color, 0.28), width=3)
             if pct:
@@ -725,11 +763,18 @@ class Flyout:
             c.create_text(x0 + 46, ry + 3, anchor="nw", text=label, fill=sub, font=f_sub)
             lvl = level_of(pct)
             num_color = {"warn": "#C8A400", "crit": "#E04343"}.get(lvl, fg)
-            c.create_text(x0 + 78, ry - 2, anchor="nw",
+            c.create_text(x0 + num_x, ry - 2, anchor="nw",
                           text="—" if pct is None else f"{pct}%", fill=num_color, font=f_big)
             c.create_text(x1 - 12, ry + 4, anchor="ne",
-                          text=_fmt_reset(d.get(f"{key}_reset")), fill=sub, font=f_sub)
-            ry += 30
+                          text=_fmt_reset(reset_val), fill=sub, font=f_sub)
+            ry += _FLY_ROW_H
+
+        for key in (first, second):
+            draw_row(d.get(f"{key}_label") or key, d.get(f"{key}_left"),
+                     d.get(f"{key}_reset"))
+        # 模型限定的周期额度（当前=Fable）：不参与 5h/7d 的主窗口切换排序，恒排最后
+        for sc in d.get("scoped") or []:
+            draw_row(sc.get("label") or "?", sc.get("left"), sc.get("reset"))
 
     # ── IP 安全卡片 ──────────────────────────────────────────────────────────
     def _ip_card(self, y0, card_bg, fg, sub, f_title, f_sub):

@@ -422,6 +422,48 @@ def live_claude_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict:
     )
 
 
+CODEX_FORECAST_PATH = pathlib.Path.home() / ".ai-limit-codex-forecast.json"
+CODEX_FORECAST_MAX_AGE_SEC = 48 * 3600
+
+
+def load_codex_forecast(path=None, now=None):
+    """读 CodeX 重置预告缓存（第二期抓取器写入，本函数只读）。
+
+    背景：CodeX 官方近期频繁做全量额度重置，tibo 会在 X 上提前预告。抓取器
+    把预测写进 ~/.ai-limit-codex-forecast.json，面板读到合法数据才渲染预告行。
+
+    校验规则（任一不满足 → None → 行隐藏，见设计文档 2026-08-28）：
+    - 合法 JSON dict，eta / fetched_at 可解析
+    - eta 尚未过去（预告过期即作废，不显示历史预告）
+    - fetched_at 距今 ≤ 48h（陈旧预测比没有更糟）
+    - confidence 归一到 high|mid|low，缺失/非法降为 low（宁可低估不高估）
+    """
+    try:
+        raw = json.loads(pathlib.Path(path or CODEX_FORECAST_PATH)
+                         .read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    now_dt = now or datetime.datetime.now(TZ_LOCAL)
+    try:
+        eta = ts_to_local(str(raw.get("eta")))
+        fetched = ts_to_local(str(raw.get("fetched_at")))
+    except Exception:
+        return None
+    if eta <= now_dt:
+        return None
+    if (now_dt - fetched).total_seconds() > CODEX_FORECAST_MAX_AGE_SEC:
+        return None
+    conf = raw.get("confidence")
+    if conf not in ("high", "mid", "low"):
+        conf = "low"
+    url = raw.get("source_url")
+    return {"eta": raw.get("eta"), "confidence": conf,
+            "source_url": str(url) if url else None,
+            "note": str(raw.get("note") or "") or None}
+
+
 def parse_scoped_limits(data) -> list:
     """从 usage 返回的 limits 数组里取按模型限定的周期额度。
 

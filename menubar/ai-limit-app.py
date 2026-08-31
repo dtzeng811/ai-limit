@@ -1351,6 +1351,7 @@ class AiLimitApp(rumps.App):
         # 原生行为），额度数据全在这块画布上，不再占用菜单项。
         self._panel_view = panelui.make_panel_view(panelui.panel_height([]))
         self._panel_view.set_ip_click(self._open_ip_site)
+        self._panel_view.set_open_url(self._open_note_url)
         self._panel_item = rumps.MenuItem("")
         self._panel_item._menuitem.setView_(self._panel_view)
 
@@ -1592,6 +1593,28 @@ class AiLimitApp(rumps.App):
                         "level": _ring_level(pct) if pct is not None else None,
                         "reset": fmt_reset(sc.get("reset"), lang) if sc.get("reset") else None,
                     })
+                # CodeX 重置预告（官方全量重置的提前预告，来源见设计文档
+                # 2026-08-28）：有合法缓存才有这行，没抓到就不该有占位
+                if svc == "codex":
+                    fc = usage.load_codex_forecast()
+                    if fc:
+                        conf_s, tone = {
+                            "high": (_tr(lang, "高概率", "Likely"), "ok"),
+                            "mid":  (_tr(lang, "中概率", "Maybe"), "warn"),
+                        }.get(fc["confidence"],
+                              (_tr(lang, "低概率", "Unsure"), None))
+                        card["rows"].append({
+                            "kind": "note",
+                            "label": _tr(lang, "预告", "Forecast"),
+                            "parts": [
+                                # 压掉重置列格式化的对齐填充：那是右对齐列用的，
+                                # 在左排的 note 行里会留一个空档
+                                {"t": "text",
+                                 "s": " ".join(_fmt_reset_iso(fc["eta"], lang).split())},
+                                {"t": "tag", "s": conf_s, "tone": tone},
+                            ],
+                            "url": fc.get("source_url"),
+                        })
             else:
                 card["error"] = _tr(lang, "读取中…", "Loading…")
             cards.append(card)
@@ -1632,6 +1655,11 @@ class AiLimitApp(rumps.App):
 
     def _open_ip_site(self):
         webbrowser.open(ipsec.SITE_URL)
+
+    def _open_note_url(self, url):
+        """note 行（CodeX 重置预告）点击：跳来源推文。只放行 http(s)。"""
+        if isinstance(url, str) and url.startswith(("https://", "http://")):
+            webbrowser.open(url)
 
     def _ip_card(self, lang):
         level = self._shield_level()

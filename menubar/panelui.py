@@ -242,9 +242,15 @@ class PanelView(AppKit.NSView):
         # 留着上一次的矩形会让空白处也能点出浏览器
         self._ip_rect = None
         self._ip_click = None
+        self._open_url = None      # note 行（预告等）点击回调，参数=该行 url
+        self._note_rects = []      # [(NSRect, url)]，每次重画重建
         return self
 
     @objc.python_method
+    def set_open_url(self, handler):
+        """注册 note 行点击回调（app 层决定怎么开 URL，本模块只管画和命中）。"""
+        self._open_url = handler
+
     def set_ip_click(self, handler):
         """IP 卡片的点击动作。用 python_method 而不是 setXxx_ 选择器：这里存的
         是个 Python callable，走 ObjC 桥接没必要也更容易出意外。"""
@@ -264,6 +270,7 @@ class PanelView(AppKit.NSView):
         y = PAD
 
         self._ip_rect = None
+        self._note_rects = []
         if not cards:
             _attr(payload.get("empty") or "", 11.5,
                   color=AppKit.NSColor.secondaryLabelColor()).drawAtPoint_(
@@ -355,10 +362,14 @@ class PanelView(AppKit.NSView):
         # 纵向对齐，逐行自适应会把主角（百分比）排成锯齿
         label_w = max((_attr(r["label"], 10.5, AppKit.NSFontWeightMedium,
                              AppKit.NSColor.secondaryLabelColor(), mono=True)
-                       .size().width for r in card["rows"]), default=0.0)
+                       .size().width for r in card["rows"]
+                       if r.get("kind") != "note"), default=0.0)
         num_off = max(30.0, label_w + 13.0)
         for row in card["rows"]:
-            self._draw_row(row, x_l, x_r, y, brand, num_off)
+            if row.get("kind") == "note":
+                self._draw_note_row(row, x_l, x_r, y)
+            else:
+                self._draw_row(row, x_l, x_r, y, brand, num_off)
             y += ROW_H
 
     def _draw_ip_card(self, card, top):
@@ -400,6 +411,46 @@ class PanelView(AppKit.NSView):
             if w <= 0:
                 break
             x += w + PART_GAP
+
+    def _draw_note_row(self, row, x_l, x_r, y):
+        """服务卡里的文字行（如 CodeX 重置预告）：标签 + parts（文字/标签），
+        无环无百分比。带 url 时行尾画 ↗ 并登记整行热区。"""
+        _draw_clipped(
+            _attr(row["label"], 10.0, AppKit.NSFontWeightMedium,
+                  AppKit.NSColor.secondaryLabelColor()),
+            x_l, y + 4.5, IP_LABEL_W)
+        url = row.get("url")
+        right_pad = 16.0 if url else 0.0   # 给行尾 ↗ 留位
+        x = x_l + IP_LABEL_W
+        for part in row.get("parts") or []:
+            avail = x_r - right_pad - x
+            if avail <= 2:
+                break
+            if part.get("t") == "tag":
+                w = _draw_tag(part["s"], x, y + 4.0, avail, part.get("tone"))
+            else:
+                color = (AppKit.NSColor.secondaryLabelColor() if part.get("dim")
+                         else AppKit.NSColor.labelColor())
+                w = _draw_clipped(
+                    _attr(part["s"], 10.5, AppKit.NSFontWeightRegular, color,
+                          mono=bool(part.get("mono"))),
+                    x, y + 4.5, avail)
+            if w <= 0:
+                break
+            x += w + PART_GAP
+        if url:
+            _draw_right(_attr("\u2197", 10.0,
+                              color=AppKit.NSColor.tertiaryLabelColor()),
+                        x_r, y + 4.5)
+            self._note_rects.append(
+                (NSMakeRect(x_l, y, x_r - x_l, ROW_H), url))
+
+    def note_hit(self, x, y):
+        """点 (x, y) 命中的 note 行 url；没命中返回 None。抽出来供离屏验证。"""
+        for rect, url in self._note_rects:
+            if AppKit.NSPointInRect(NSMakePoint(x, y), rect):
+                return url
+        return None
 
     def _draw_row(self, row, x_l, x_r, y, brand, num_off=30.0):
         pct = row.get("pct")
@@ -459,6 +510,16 @@ class PanelView(AppKit.NSView):
 
     def mouseDown_(self, event):
         pt = self.convertPoint_fromView_(event.locationInWindow(), None)
+        url = self.note_hit(pt.x, pt.y)
+        if url and self._open_url:
+            try:
+                item = self.enclosingMenuItem()
+                if item is not None and item.menu() is not None:
+                    item.menu().cancelTracking()
+            except Exception:
+                pass
+            self._open_url(url)
+            return
         if not (self._ip_click and self.ip_hit(pt.x, pt.y)):
             return
         # 先收菜单再开浏览器：菜单是模态跟踪状态，留着它会挡在新窗口前面

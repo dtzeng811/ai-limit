@@ -1618,7 +1618,7 @@ class AiLimitApp(rumps.App):
                             body = " ".join(_fmt_reset_iso(fc["eta"], lang).split())
                         card["rows"].append({
                             "kind": "note",
-                            "label": _tr(lang, "预告", "Forecast"),
+                            "label": _tr(lang, "重置预测", "Forecast"),
                             "parts": [
                                 {"t": "text", "s": body},
                                 {"t": "tag", "s": conf_s, "tone": tone},

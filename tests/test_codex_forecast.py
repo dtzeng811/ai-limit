@@ -11,7 +11,7 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from usage import load_codex_forecast  # noqa: E402
+from usage import CODEX_FORECAST_PAGE, load_codex_forecast, map_reset_forecast  # noqa: E402
 
 FAILS = []
 
@@ -70,6 +70,40 @@ check("source_url 缺失 → None（行不可点）",
 check("Z 后缀时间兼容",
       load({**GOOD, "eta": "2026-08-28T23:00:00Z",
             "fetched_at": "2026-08-28T02:00:00Z"}, "zulu") is not None, True)
+
+print("\n【window 档（概率预测）】")
+WIN = {"kind": "window", "p24": 25, "p48": 45,
+       "source_url": "https://x.com/u/status/9",
+       "fetched_at": "2026-08-28T08:00:00+00:00"}
+r = load(WIN, "win")
+check("合法 window → 透传", r is not None, True)
+check("45% → mid 档", r["confidence"], "mid")
+check("p60 → high 档", load({**WIN, "p48": 60}, "w60")["confidence"], "high")
+check("p29 → low 档", load({**WIN, "p24": 5, "p48": 29}, "w29")["confidence"], "low")
+check("window 超 12h → None（比 eta 档严）",
+      load({**WIN, "fetched_at": "2026-08-27T23:00:00+00:00"}, "wstale"), None)
+check("p 缺失 → None", load({"kind": "window", "p24": 25,
+      "fetched_at": "2026-08-28T08:00:00+00:00"}, "wnop"), None)
+check("p 越界 → None", load({**WIN, "p48": 145}, "wover"), None)
+check("p=True(布尔) → None", load({**WIN, "p24": True}, "wbool"), None)
+check("无 url → 退到站点页", load({k: v for k, v in WIN.items()
+      if k != "source_url"}, "wnourl")["source_url"], CODEX_FORECAST_PAGE)
+
+print("\n【map_reset_forecast：真实 API 夹具（2026-08-31 实测原样）】")
+real = json.loads((pathlib.Path(__file__).parent / "fixtures"
+                   / "codex-reset-forecast-2026-08-31.json").read_text())
+m = map_reset_forecast(real, now=NOW)
+check("真实返回可映射", m is not None, True)
+check("p24 取 rounded", m["p24"], 25)
+check("p48 取 rounded", m["p48"], 45)
+check("url 取官宣推文", "x.com/thsottiaux" in m["source_url"], True)
+check("非 dict 入参不崩", map_reset_forecast(None), None)
+check("缺 probabilities → None", map_reset_forecast({"mode": "x"}), None)
+check("probabilities 缺档 → None",
+      map_reset_forecast({"probabilities": {"rounded_24h": 5}}), None)
+check("official_signal 缺失 → 退站点页", map_reset_forecast(
+      {"probabilities": {"rounded_24h": 1, "rounded_48h": 2}},
+      now=NOW)["source_url"], CODEX_FORECAST_PAGE)
 
 print("\n" + ("FAILED: " + ", ".join(FAILS) if FAILS else "ALL PASS"))
 sys.exit(1 if FAILS else 0)

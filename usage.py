@@ -29,7 +29,7 @@ _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 _MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.23+fork.10"
+__version__ = "0.3.23+fork.11"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -423,7 +423,11 @@ def live_claude_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict:
 
 
 CODEX_FORECAST_PATH = pathlib.Path.home() / ".ai-limit-codex-forecast.json"
-CODEX_FORECAST_MAX_AGE_SEC = 48 * 3600
+CODEX_FORECAST_MAX_AGE_SEC = 48 * 3600          # eta（官宣定时）档的保鲜期
+CODEX_FORECAST_WINDOW_MAX_AGE_SEC = 12 * 3600   # window（概率）档：过 12h 就该有新一轮抓取顶上
+CODEX_FORECAST_API = "https://codex-reset.com/api/forecast"
+CODEX_FORECAST_PAGE = "https://codex-reset.com/tibo"
+CODEX_FORECAST_REFRESH_SEC = 30 * 60   # 概率变化以小时计，30 分钟足够，也符合低调采集
 
 
 def load_codex_forecast(path=None, now=None):
@@ -446,6 +450,8 @@ def load_codex_forecast(path=None, now=None):
     if not isinstance(raw, dict):
         return None
     now_dt = now or datetime.datetime.now(TZ_LOCAL)
+    if raw.get("kind") == "window":
+        return _load_window_forecast(raw, now_dt)
     try:
         eta = ts_to_local(str(raw.get("eta")))
         fetched = ts_to_local(str(raw.get("fetched_at")))
@@ -462,6 +468,75 @@ def load_codex_forecast(path=None, now=None):
     return {"eta": raw.get("eta"), "confidence": conf,
             "source_url": str(url) if url else None,
             "note": str(raw.get("note") or "") or None}
+
+
+def _load_window_forecast(raw, now_dt):
+    """window 档（codex-reset.com 的概率预测）：没有精确时刻，只有
+    「24h/48h 内重置概率」。p24/p48 必须是 0-100 的数，缺一不可。"""
+    try:
+        fetched = ts_to_local(str(raw.get("fetched_at")))
+    except Exception:
+        return None
+    if (now_dt - fetched).total_seconds() > CODEX_FORECAST_WINDOW_MAX_AGE_SEC:
+        return None
+    p24, p48 = raw.get("p24"), raw.get("p48")
+    ok = (isinstance(p24, (int, float)) and not isinstance(p24, bool)
+          and isinstance(p48, (int, float)) and not isinstance(p48, bool)
+          and 0 <= p24 <= 100 and 0 <= p48 <= 100)
+    if not ok:
+        return None
+    strongest = max(p24, p48)
+    conf = "high" if strongest >= 60 else ("mid" if strongest >= 30 else "low")
+    url = raw.get("source_url")
+    return {"kind": "window", "p24": int(round(p24)), "p48": int(round(p48)),
+            "confidence": conf,
+            "source_url": str(url) if url else CODEX_FORECAST_PAGE,
+            "note": str(raw.get("note") or "") or None}
+
+
+def map_reset_forecast(api, now=None):
+    """codex-reset.com /api/forecast 原始返回 → 缓存文件契约。
+
+    只消费实测见过的字段（2026-08-31 夹具）：probabilities.rounded_24h/48h、
+    official_signal.url、updated_at。teased_window 实测只见过 null，结构未知，
+    在观察到非空样本之前**不解析**——按假设写解析等于给自己埋
+    AttributeError（ipsec dns_servers 的教训）。
+    """
+    if not isinstance(api, dict):
+        return None
+    probs = api.get("probabilities")
+    if not isinstance(probs, dict):
+        return None
+    p24, p48 = probs.get("rounded_24h"), probs.get("rounded_48h")
+    if p24 is None or p48 is None:
+        return None
+    sig = api.get("official_signal")
+    url = sig.get("url") if isinstance(sig, dict) else None
+    now_dt = now or datetime.datetime.now(TZ_LOCAL)
+    return {"kind": "window", "p24": p24, "p48": p48,
+            "source_url": url or CODEX_FORECAST_PAGE,
+            "note": "codex-reset.com 实验模型",
+            "fetched_at": now_dt.isoformat(timespec="seconds")}
+
+
+def fetch_codex_forecast_remote(timeout: int = 15) -> bool:
+    """拉一轮预告并原子写入缓存文件。成功返回 True；任何失败静默返回 False
+    ——旧缓存留在原地，由读取侧的保鲜期规则自然淘汰，不用这里删。"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            CODEX_FORECAST_API, headers={"User-Agent": _chrome_ua()})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        out = map_reset_forecast(data)
+        if out is None:
+            return False
+        tmp = CODEX_FORECAST_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CODEX_FORECAST_PATH)
+        return True
+    except Exception:
+        return False
 
 
 def parse_scoped_limits(data) -> list:

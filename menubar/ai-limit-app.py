@@ -1277,6 +1277,11 @@ class AiLimitApp(rumps.App):
         # IP 检测独立定时器：频率固定 10 分钟，不跟随用户选的额度刷新频率
         self._ip_timer = rumps.Timer(self._auto_ip_refresh, _IPSEC_REFRESH_SEC)
         self._ip_timer.start()
+        # CodeX 重置预告：30 分钟一轮（概率以小时计变化，再快是骚扰数据源）。
+        # 失败静默，旧缓存由读取侧保鲜期淘汰
+        self._forecast_timer = rumps.Timer(
+            self._auto_forecast_refresh, usage.CODEX_FORECAST_REFRESH_SEC)
+        self._forecast_timer.start()
 
     def _refresh_sec(self):
         return self._state.get("refresh_min", _DEFAULT_REFRESH_MIN) * 60
@@ -1603,14 +1608,19 @@ class AiLimitApp(rumps.App):
                             "mid":  (_tr(lang, "中概率", "Maybe"), "warn"),
                         }.get(fc["confidence"],
                               (_tr(lang, "低概率", "Unsure"), None))
+                        if fc.get("kind") == "window":
+                            # 概率档：没有精确时刻就不编造一个，如实给
+                            # 「24h X% · 48h Y%」（数据源只给窗口概率）
+                            body = f"24h {fc['p24']}% · 48h {fc['p48']}%"
+                        else:
+                            # 压掉重置列格式化的对齐填充：那是右对齐列用的，
+                            # 在左排的 note 行里会留一个空档
+                            body = " ".join(_fmt_reset_iso(fc["eta"], lang).split())
                         card["rows"].append({
                             "kind": "note",
                             "label": _tr(lang, "预告", "Forecast"),
                             "parts": [
-                                # 压掉重置列格式化的对齐填充：那是右对齐列用的，
-                                # 在左排的 note 行里会留一个空档
-                                {"t": "text",
-                                 "s": " ".join(_fmt_reset_iso(fc["eta"], lang).split())},
+                                {"t": "text", "s": body},
                                 {"t": "tag", "s": conf_s, "tone": tone},
                             ],
                             "url": fc.get("source_url"),
@@ -1701,6 +1711,12 @@ class AiLimitApp(rumps.App):
     def _auto_ip_refresh(self, _):
         self._kick_ip_fetch(jitter=True)
 
+    def _auto_forecast_refresh(self, _=None):
+        def run():
+            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+            usage.fetch_codex_forecast_remote()
+        threading.Thread(target=run, daemon=True).start()
+
     def _kick_ip_fetch(self, jitter=False):
         """启动后台线程跑一轮 IP 检测；关掉这个功能时一个请求都不发。"""
         if not self._state.get("ip_security", True):
@@ -1749,6 +1765,7 @@ class AiLimitApp(rumps.App):
         self._refresh_from_cache()
         self._kick_background_fetch()
         self._kick_ip_fetch()
+        self._auto_forecast_refresh()   # 预告首轮：不等 30 分钟节拍
         self._check_update_failure_marker()
         # 仅测试用：Stage 3 端到端联调没有人工点"检查更新"菜单项的手段，
         # 用同一个 autotest 环境变量在启动后自动触发一次，和上面跳过确认弹窗

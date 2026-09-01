@@ -73,7 +73,7 @@ class BoardLinkServer:
     def __init__(self, snapshot_fn):
         self._snapshot_fn = snapshot_fn
         self._httpd = None
-        self._netservice = None
+        self._dnssd = None
         self.port = None
 
     def start(self):
@@ -110,21 +110,27 @@ class BoardLinkServer:
         return self.port
 
     def _publish(self):
-        """Bonjour 广播。只在 macOS（菜单栏宿主）可用；失败不致命——
-        板子会在下一次服务发现失败时报 error=discover，宿主日志可查。"""
+        """Bonjour 广播：直接用系统自带 dns-sd 子进程。
+
+        为什么不用 NSNetService：它依赖调用线程的 NSRunLoop 调度，在 py2app
+        bundle 里（__init__ 先于 runloop 启动执行）实测发布不出去；dns-sd -R
+        是 mDNSResponder 官方客户端，进程活着注册就活着，退出即注销，行为
+        完全确定。失败不致命——板子会报 error=discover，宿主可查。"""
+        import atexit
+        import subprocess
         try:
-            from Foundation import NSNetService
-            self._netservice = NSNetService.alloc(
-            ).initWithDomain_type_name_port_("", SERVICE_TYPE, SERVICE_NAME,
-                                             self.port)
-            self._netservice.publish()
+            self._dnssd = subprocess.Popen(
+                ["/usr/bin/dns-sd", "-R", SERVICE_NAME, "_ailimit._tcp", ".",
+                 str(self.port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            atexit.register(self.stop)
         except Exception:
-            self._netservice = None
+            self._dnssd = None
 
     def stop(self):
-        if self._netservice is not None:
-            self._netservice.stop()
-            self._netservice = None
+        if getattr(self, "_dnssd", None) is not None:
+            self._dnssd.terminate()
+            self._dnssd = None
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd = None
@@ -132,8 +138,6 @@ class BoardLinkServer:
 
 if __name__ == "__main__":
     # 演示模式：无需菜单栏 app 即可给板子供数（联调用）。
-    # Bonjour 走 NSNetService；若在非 GUI 环境失败，可另开
-    # `dns-sd -R ai-limit _ailimit._tcp . <port>` 手动广播。
     import time
 
     def _demo_snapshot():

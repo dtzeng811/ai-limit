@@ -22,7 +22,7 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "ai-limit.icns",
     "packages": ["rumps", "browser_cookie3", "Cryptodome"],
-    "includes": ["usage", "ipsec", "quotacore", "panelui"],  # 显式声明仓库根的跨平台模块 + 面板绘制模块，确保打包
+    "includes": ["usage", "ipsec", "quotacore", "panelui", "boardlink"],  # 显式声明仓库根的跨平台模块 + 面板绘制/桌面小屏供数模块，确保打包
     "resources": ["ai-limit-updater.sh"],  # 一键更新 helper 脚本，随 App 一起签名封印
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示
@@ -34,7 +34,7 @@ OPTIONS = {
         # 不能带 +fork 后缀（macOS 会拒绝），fork 标识放在 ShortVersionString。
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit.fork",
         "CFBundleVersion": "0.3.23",
-        "CFBundleShortVersionString": "0.3.23-fork.12",
+        "CFBundleShortVersionString": "0.3.23-fork.13",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
     },
 }

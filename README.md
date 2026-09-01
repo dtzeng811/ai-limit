@@ -20,6 +20,15 @@
 
 Claude 卡片在 5h / 7d 之外还有第三行：**按模型限定的周期额度**（上图的 Fable 行）——这一档在 claude.ai 用量页看得到，但一般的菜单栏工具不显示。标签用服务端下发的模型名，旗舰换代时自动跟随，无需升级 App。macOS 面板与 Windows flyout 均已支持（Windows 上同时进入托盘悬浮 tooltip）。
 
+## CodeX 重置预测（fork 版新增）
+
+近期 CodeX 官方会不定期做全量额度重置（负责人 tibo 常在 X 上预告/官宣）。CodeX 卡片因此多了一行**重置预测**：未来 24h / 48h 内发生重置的概率 + 概率档标签，**整行点击跳转最近一条官宣推文**。
+
+- 数据来自社区「Tibo 雷达」[codex-reset.com](https://codex-reset.com/tibo) 的公开接口（其每 2 分钟同步 @thsottiaux 的 X，28+ 次已验证重置打底）；App 端 **30 分钟拉取一轮** + 随机抖动，与其余采集同一套低调哲学
+- 概率档：≥60% 绿「高概率」 / ≥30% 黄「中概率」 / 其余灰「低概率」
+- 这是**概率预测不是官方承诺**——数据源自标为实验模型；拿不到数据或缓存超 12 小时，整行自动隐藏，不显示陈旧概率
+- 目前 macOS 面板支持，Windows flyout 下个版本跟进
+
 <table><tr>
   <td><img src="docs/screenshot-panel-light.png" width="300" /></td>
   <td><img src="docs/screenshot-panel-dark.png" width="300" /></td>

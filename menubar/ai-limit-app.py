@@ -47,6 +47,7 @@ from usage import (
     CLAUDE_STATUS_PAGE_URL,
     CODEX_STATUS_PAGE_URL,
 )
+import boardlink
 import ipsec
 import quotacore
 
@@ -1282,6 +1283,45 @@ class AiLimitApp(rumps.App):
         self._forecast_timer = rumps.Timer(
             self._auto_forecast_refresh, usage.CODEX_FORECAST_REFRESH_SEC)
         self._forecast_timer.start()
+        # 桌面小屏（ES3C28P）供数：局域网 HTTP + Bonjour 广播。失败不致命，
+        # 不影响菜单栏本体；快照函数只读内存字典，线程安全性依赖 GIL 的
+        # 原子引用替换（_apply_pending 里整字典赋值，不做原地修改）。
+        self._boardlink = boardlink.BoardLinkServer(self._board_snapshot)
+        try:
+            self._boardlink.start()
+        except Exception:
+            pass
+
+    def _board_snapshot(self):
+        """桌面小屏的显示级快照（契约见 boardlink 模块 docstring）。
+        板端 UI 固定中文，重置行一律按 zh 排版，不跟随菜单栏语言。"""
+        services = []
+        for svc, data, title, fmt_reset in (
+            ("claude", self._claude or {}, "Claude Code", _fmt_reset_iso),
+            ("codex", self._codex or {}, "CodeX", _fmt_reset_epoch),
+        ):
+            if not data or "error" in data:
+                continue
+            rows = [
+                (data.get("5h_label") or "5h", data.get("5h_left")),
+                (data.get("7d_label") or "7d", data.get("7d_left")),
+            ]
+            for sc in (data.get("scoped") or [])[:1]:
+                rows.append((sc.get("label") or "?", sc.get("left")))
+            parts = []
+            for key in ("5h_reset", "7d_reset"):
+                if data.get(key):
+                    parts.append(fmt_reset(data.get(key), "zh"))
+            footer = ("重置 " + " · ".join(parts)) if parts else ""
+            if svc == "codex":
+                fc = usage.load_codex_forecast()
+                if fc and fc.get("kind") == "window":
+                    footer = (f"重置预测 24h {fc['p24']}% · "
+                              f"48h {fc['p48']}%")
+            services.append(boardlink.build_service_entry(
+                title, _plan_label(data.get("plan")), rows, footer))
+        return {"v": boardlink.CONTRACT_VERSION, "ts": int(time.time()),
+                "services": services}
 
     def _refresh_sec(self):
         return self._state.get("refresh_min", _DEFAULT_REFRESH_MIN) * 60

@@ -117,7 +117,13 @@ _MENU_MIN_WIDTH = 290
 # ── IP 安全度 ────────────────────────────────────────────────────────────────
 # 10 分钟一轮，不跟额度共用 3 分钟节拍：出口 IP / DNS 出口不会分钟级变化，
 # 按额度频率去测只是白白增加对 claude.ai 和 ip.net.coffee 的请求量。
-_IPSEC_REFRESH_SEC = 10 * 60
+_IPSEC_REFRESH_SEC = quotacore.IPSEC_REFRESH_SEC
+# IP 侧的陈旧上限走自己的节奏（4 轮）：用额度那边的 15 分钟会让第 2 次失败
+# 就因过期变灰，抢在「连败 3 次」规则前面触发
+_IPSEC_STALE_MAX_SEC = quotacore.IPSEC_STALE_MAX_SEC
+# 手动刷新最小冷却：挡住连点造成的请求突发。用户显式操作仍可 force 跳过冷却，
+# 但并发保护始终生效，所以最坏也只是"正在抓的那一组"，不会叠加。
+_MANUAL_REFRESH_COOLDOWN_SEC = 5.0
 _IPSEC_FAIL_GRACE  = 3       # 连败到这个次数盾牌才变灰（同额度的 _FAIL_GRACE_N 哲学）
 _SHIELD_SIZE   = _RING_SIZE  # 跟环同高，菜单栏一行里三个图标视觉等重
 _SHIELD_GAP    = 4.0         # 盾牌左侧留白，跟 CodeX 的数字分开
@@ -549,12 +555,16 @@ def _ip_card_rows(data, lang):
     if not data.get("dns_ok"):
         parts = [{"t": "text", "s": _tr(lang, "不可用", "Unavailable"), "dim": True}]
     elif data.get("dns_leaked"):
-        # dns_servers 实际是纯 IP 字符串数组，国家要另查——统一走 ipsec 的
-        # 归一化取值（早期这里按 dict 假设写 s.get()，非空时直接抛异常）
-        where = ", ".join(sorted({
-            (ipsec.dns_server_country(s) or "?").title()
-            for s in data.get("dns_servers") or []
-        }))
+        # 国家在 probe() 阶段就算好放进 dns_server_countries 了，这里**只读不查**：
+        # 从前是在主线程渲染时逐个现查 geoip（12s 超时 × N 个 IP），面板每重绘
+        # 一次就来一轮，网络一慢界面直接卡死。查不到就退回显示出口 IP 本身。
+        cmap = data.get("dns_server_countries") or {}
+        names = []
+        for sv in data.get("dns_servers") or []:
+            ip_ = ipsec.dns_server_ip(sv)
+            c = (cmap.get(ip_) or "").strip()
+            names.append(c.title() if c else (ip_ or "?"))
+        where = ", ".join(sorted(set(names)))
         parts = [{"t": "text", "s": _tr(lang, f"出口在 {where}", f"Exits in {where}")},
                  {"t": "tag", "s": _tr(lang, "泄露", "Leaked"), "tone": "crit"}]
     elif data.get("dns_servers"):
@@ -630,6 +640,9 @@ def _load_state():
              "refresh_min_migrated": True,
              # IP 安全度：关掉时面板卡片和菜单栏盾牌一起消失（也就不再发检测请求）
              "ip_security": True,
+             # 桌面小屏供数：默认开（保持既有行为）。在不可信网络（咖啡厅、
+             # 公司网）下可以一键关掉——关掉即停服务、注销 Bonjour、不再监听
+             "boardlink": True,
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
     try:
@@ -671,6 +684,8 @@ def _load_state():
                 state["refresh_min"] = saved_min              # 用户显式选择，原样保留
             if isinstance(raw.get("ip_security"), bool):
                 state["ip_security"] = raw["ip_security"]
+            if isinstance(raw.get("boardlink"), bool):
+                state["boardlink"] = raw["boardlink"]
             if isinstance(raw.get("claude_status_components"), list):
                 state["claude_status_components"] = [
                     c for c in raw["claude_status_components"] if c in _CLAUDE_STATUS_ALL]
@@ -775,6 +790,27 @@ def _cached_claude_plan():
     return quotacore.cached_claude_plan(live_claude_plan)
 
 
+def _err(msg, exc=None):
+    """统一构造错误字典，带上退避分类与 Retry-After。
+
+    quotacore.AbsorbState 读 error_kind / retry_after_sec 决定退避力度：
+    认证失效与被限流不等连败宽限、第一次就退避，其余保持原有抖动吸收语义。
+    Cloudflare 挑战归入 auth——继续撞只会被拦得更死，必须等用户去浏览器过验证。
+    """
+    d = {"error": msg}
+    if exc is None:
+        return d
+    kind = getattr(exc, "kind", "generic")
+    if kind == "cloudflare":
+        kind = "auth"
+    if kind in ("auth", "rate_limit"):
+        d["error_kind"] = kind
+    ra = quotacore.parse_retry_after(getattr(exc, "retry_after", None))
+    if ra:
+        d["retry_after_sec"] = ra
+    return d
+
+
 def _fetch_claude(lang):
     import socket, urllib.error
     try:
@@ -800,7 +836,7 @@ def _fetch_claude(lang):
             msg = str(e)
             if "JSON" in msg or "DOCTYPE" in msg or "html" in msg.lower():
                 msg = _tr(lang, "网络不可用或需重新登录 claude.ai", "Network error or re-login at claude.ai required")
-        return {"error": msg}
+        return _err(msg, e)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -831,12 +867,12 @@ def _fetch_codex(lang):
         # 透传数据层的具体原因（它已区分「登录态过期」与「无订阅」，且自带
         # i18n）。此前这里硬编码一句笼统文案，把服务端明确给出的
         # token_expired 也说成「可能未订阅」，用户会先去查订阅而不是重新登录。
-        return {"error": str(e)}
+        return _err(str(e), e)
     except CodexWebError as e:
         msg = str(e)
         if "timed out" in msg or "urlopen" in msg:
             msg = _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")
-        return {"error": msg}
+        return _err(msg, e)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -844,12 +880,54 @@ def _fetch_codex(lang):
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
+# 状态页独立 TTL：它以十分钟计变化，此前却跟额度同频每 3 分钟抓一次——
+# 两个端点 × 20 次/小时 = 960 次/天，纯浪费且是最大的一块请求量。10 分钟与
+# IP 检测同节奏；失败进指数退避，不再失败后每轮硬撞。
+_STATUS_TTL_SEC = quotacore.IPSEC_REFRESH_SEC
+_STATUS_CACHES = {}
+
+
+def _status_cache(url):
+    if url not in _STATUS_CACHES:
+        _STATUS_CACHES[url] = quotacore.TTLCache(
+            _STATUS_TTL_SEC, fail_backoff_sec=_STATUS_TTL_SEC,
+            failed=lambda v: v == "unknown")
+    return _STATUS_CACHES[url]
+
+
+def _start_timer_deferred(timer):
+    """启动 rumps.Timer，但把**第一次**触发推迟一个完整周期。
+
+    rumps.Timer.start() 里 fireDate 传的是 NSDate.date()（就是"现在"），
+    NSTimer 因此会在下一次 runloop 立刻触发一次回调。后果有两处：
+    1. 启动时：三个定时器各自立刻打一轮，而 _init_render 里还会显式再打一轮
+    2. 用户每改一次刷新频率：定时器重建 → 又白发一轮
+
+    这里在 start() 之后把 fireDate 推到"现在 + 一个周期"，让定时器只负责
+    周期性触发，首轮统一由 _init_render 显式发起——谁负责首轮变得明确。
+    拿不到 _nstimer（rumps 版本差异）就退回原行为，不影响功能。
+    """
+    timer.start()
+    try:
+        nstimer = timer._nstimer
+        nstimer.setFireDate_(
+            AppKit.NSDate.dateWithTimeIntervalSinceNow_(timer.interval))
+    except Exception:
+        pass
+    return timer
+
+
 def _fetch_status(components_url):
     """包一层 usage.fetch_status_components：把失败的 None 转成字符串 "unknown"，
     跟"服务被禁用没抓"用的 None 区分开——调用方看到 "unknown" 就必须显示 ❓，
-    看到 None 就维持上次的值（服务被禁用，不是失败）。"""
-    components = fetch_status_components(components_url)
-    return components if components is not None else "unknown"
+    看到 None 就维持上次的值（服务被禁用，不是失败）。
+
+    走 TTLCache：TTL 内直接回缓存不发请求，失败后退避。语义不变——失败仍如实
+    返回 "unknown"，不拿旧值伪装成新值。"""
+    def _pull():
+        components = fetch_status_components(components_url)
+        return components if components is not None else "unknown"
+    return _status_cache(components_url).get(_pull)
 
 # ── AppKit 辅助 ───────────────────────────────────────────────────────────────
 
@@ -1258,6 +1336,8 @@ class AiLimitApp(rumps.App):
         # （额度进指数退避时不该顺带停掉 IP 检测，反之亦然）
         self._ipsec = None          # 最近一次成功的检测结果
         self._ipsec_fail = 0        # 连续失败次数，到 _IPSEC_FAIL_GRACE 才变灰
+        self._ipsec_good_ts = 0.0        # 上次成功检测时刻（陈旧判定用）
+        self._ipsec_backoff_until = 0.0  # IP 检测的退避截止；此前这条链路完全没有退避
         self._ip_pending = None
         self._ip_lock = threading.Lock()
         # 检查更新：同样模式，后台线程查完放这里，_apply_pending 接力弹窗
@@ -1270,25 +1350,33 @@ class AiLimitApp(rumps.App):
         self._download_lock = threading.Lock()
         self._last_refresh_str = "…"   # 折进刷新频率子菜单标题，无单独菜单行
         self._panel_view = None   # 详情面板视图，在 _build_menu 里建
+        # 三条抓取线各自的并发去重闸门。此前每个触发点都无条件起线程：连点
+        # 「立即刷新」= 连开 N 组并发抓取，自动刷新与手动刷新也会重叠——既浪费
+        # 请求也让流量形态像自动化脚本。冷却只挡自动触发，用户显式操作走
+        # force=True（但并发保护始终生效，正在抓就不会再开一组）。
+        self._fetch_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
+        self._ip_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
+        self._forecast_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._build_menu()
         # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
         # 不用 @rumps.timer 装饰器——那是静态绑定，改不了间隔。
         self._auto_timer = rumps.Timer(self._auto_refresh, self._refresh_sec())
-        self._auto_timer.start()
+        _start_timer_deferred(self._auto_timer)
         # IP 检测独立定时器：频率固定 10 分钟，不跟随用户选的额度刷新频率
         self._ip_timer = rumps.Timer(self._auto_ip_refresh, _IPSEC_REFRESH_SEC)
-        self._ip_timer.start()
+        _start_timer_deferred(self._ip_timer)
         # CodeX 重置预告：30 分钟一轮（概率以小时计变化，再快是骚扰数据源）。
         # 失败静默，旧缓存由读取侧保鲜期淘汰
         self._forecast_timer = rumps.Timer(
             self._auto_forecast_refresh, usage.CODEX_FORECAST_REFRESH_SEC)
-        self._forecast_timer.start()
+        _start_timer_deferred(self._forecast_timer)
         # 桌面小屏（ES3C28P）供数：局域网 HTTP + Bonjour 广播。失败不致命，
         # 不影响菜单栏本体；快照函数只读内存字典，线程安全性依赖 GIL 的
         # 原子引用替换（_apply_pending 里整字典赋值，不做原地修改）。
         self._boardlink = boardlink.BoardLinkServer(self._board_snapshot)
         try:
-            self._boardlink.start()
+            if self._state.get("boardlink", True):
+                self._boardlink.start()
         except Exception:
             pass
 
@@ -1462,6 +1550,7 @@ class AiLimitApp(rumps.App):
         self._panel_claude = rumps.MenuItem("Claude Code", callback=self._toggle_panel_claude)
         self._panel_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_panel_codex)
         self._panel_ipsec  = rumps.MenuItem("",            callback=self._toggle_panel_ipsec)
+        self._boardlink_item = rumps.MenuItem("", callback=self._toggle_boardlink)
         self._panel_menu = rumps.MenuItem("")
         self._panel_menu.add(self._panel_claude)
         self._panel_menu.add(self._panel_codex)
@@ -1549,6 +1638,7 @@ class AiLimitApp(rumps.App):
             self._mode_menu,
             self._bar_menu,
             self._panel_menu,
+            self._boardlink_item,
             self._lang_menu,
             self._login_item,
             None,
@@ -1566,6 +1656,7 @@ class AiLimitApp(rumps.App):
         self._update_lang_checks()
         self._update_bar_checks()
         self._update_panel_checks()
+        self._update_boardlink_check()
         self._update_rate_checks()
         self._update_status_checks()
 
@@ -1744,22 +1835,55 @@ class AiLimitApp(rumps.App):
             return
         if new.get("error"):
             self._ipsec_fail += 1
+            # 退避此前**完全不存在**：只累加计数就 return，盾牌变灰之后
+            # 10 分钟定时器照打不误，claude.ai 被拦时仍每天敲它 144 次。
+            # winbar / linuxbar 走 quotacore.AbsorbState 都有退避，唯独 macOS
+            # 这份手写实现漏了——正是 quotacore 想消灭的那类三端漂移。
+            delay = quotacore.failure_backoff_sec(
+                new, self._ipsec_fail, _IPSEC_REFRESH_SEC)
+            if delay > 0:
+                self._ipsec_backoff_until = time.time() + delay
+            # 手里那份好数据太旧就别再沿用（与额度侧的 STALE 语义对齐）
+            if (self._ipsec and
+                    time.time() - self._ipsec_good_ts > _IPSEC_STALE_MAX_SEC):
+                self._ipsec = new
             return
         self._ipsec_fail = 0
+        self._ipsec_good_ts = time.time()
+        self._ipsec_backoff_until = 0.0
         self._ipsec = new
+
+    def _ip_in_backoff(self):
+        return time.time() < self._ipsec_backoff_until
 
     def _auto_ip_refresh(self, _):
         self._kick_ip_fetch(jitter=True)
 
-    def _auto_forecast_refresh(self, _=None):
+    def _auto_forecast_refresh(self, _=None, force=False):
+        """CodeX 重置预测抓取。此前是裸线程无任何去重——启动首轮与 30 分钟
+        定时器若撞在一起就是两个请求，用户连点刷新也会各起一个。"""
+        if not self._forecast_gate.try_begin(force=force):
+            return
+
         def run():
-            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
-            usage.fetch_codex_forecast_remote()
+            try:
+                time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+                usage.fetch_codex_forecast_remote()
+            finally:
+                self._forecast_gate.end()
         threading.Thread(target=run, daemon=True).start()
 
-    def _kick_ip_fetch(self, jitter=False):
-        """启动后台线程跑一轮 IP 检测；关掉这个功能时一个请求都不发。"""
+    def _kick_ip_fetch(self, jitter=False, force=False):
+        """启动后台线程跑一轮 IP 检测；关掉这个功能时一个请求都不发。
+
+        一轮 probe() 内含多个 HTTP + DNS 解析，重叠执行代价尤其大，且 ipsec 的
+        DNS 探针要串行持有全局 socket 超时锁——并发跑会互相排队拖长持锁窗口。
+        """
         if not self._state.get("ip_security", True):
+            return
+        if not force and self._ip_in_backoff():
+            return                     # 退避期内这一轮直接不发
+        if not self._ip_gate.try_begin(force=force):
             return
         threading.Thread(target=self._async_ip_refresh, args=(jitter,),
                          daemon=True).start()
@@ -1771,14 +1895,17 @@ class AiLimitApp(rumps.App):
         socket 模块层面的异常）——后台线程未捕获异常会静默吃掉这一轮结果，
         _ip_pending 永远拿不到值，盾牌就永久停在"检测中"。
         """
-        if jitter:
-            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
         try:
-            result = ipsec.probe()
-        except Exception as e:
-            result = {"error": f"{type(e).__name__}: {e}"}
-        with self._ip_lock:
-            self._ip_pending = result
+            if jitter:
+                time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+            try:
+                result = ipsec.probe()
+            except Exception as e:
+                result = {"error": f"{type(e).__name__}: {e}"}
+            with self._ip_lock:
+                self._ip_pending = result
+        finally:
+            self._ip_gate.end()
 
     def _render_panel(self):
         """重画菜单里的面板视图。菜单项高度跟着 view 的 frame 走，所以卡片
@@ -1939,12 +2066,14 @@ class AiLimitApp(rumps.App):
             self._svc_backoff_until[svc] = 0.0
             return new
         self._svc_fail[svc] += 1
-        # 连败达到宽限次数后进入指数退避：跳过 1、2、4、8… 个刷新周期，
-        # 上限 _BACKOFF_MAX_SEC。持续被 Cloudflare 拦时不再按原频率硬撞，
-        # 给拦截热度降温的窗口，也避免在风控画像里累积"拦不住"的负面信号。
-        over = self._svc_fail[svc] - _FAIL_GRACE_N
-        if over >= 0:
-            delay = min(self._refresh_sec() * (2 ** over), _BACKOFF_MAX_SEC)
+        # 退避时长交给 quotacore.failure_backoff_sec —— 与 AbsorbState 同一份
+        # 实现。连败达宽限后指数退避（跳过 1、2、4… 个刷新周期，上限 30 分钟）；
+        # 401/403/Cloudflare 与 429 则不等宽限、首次即退避，429 还会尊重服务端
+        # 给的 Retry-After。持续被拦时不再按原频率硬撞，也不在风控画像里累积
+        # "拦不住"的负面信号。
+        delay = quotacore.failure_backoff_sec(
+            new, self._svc_fail[svc], self._refresh_sec())
+        if delay > 0:
             self._svc_backoff_until[svc] = time.time() + delay
         has_good = bool(cur) and "error" not in cur
         fresh = (time.time() - self._svc_good_ts.get(svc, 0.0)) <= _STALE_MAX_SEC
@@ -1968,13 +2097,41 @@ class AiLimitApp(rumps.App):
                 self._svc_good_ts["codex"] = time.time()
         self._render()
 
-    def _kick_background_fetch(self, jitter=False):
-        """启动后台线程抓数据；线程内不要碰任何 UI 对象。"""
+    def _fetch_if_missing(self, enabled):
+        """服务开关变化后按需抓取。
+
+        开关只影响"画不画"，内存里已有的数据依然有效——此前每切一次开关就
+        无条件全量重抓（含两个状态页），用户在子菜单里点几下就是几组请求。
+        只有新启用的服务确实还没数据（或上次是错误态）时才值得去拉。
+        """
+        need = False
+        for svc in enabled:
+            data = self._claude if svc == "claude" else self._codex
+            if not data or "error" in data:
+                need = True
+                break
+        if need:
+            self._kick_background_fetch()
+
+    def _kick_background_fetch(self, jitter=False, force=False):
+        """启动后台线程抓数据；线程内不要碰任何 UI 对象。
+
+        经 _fetch_gate 去重：已有一轮在飞就直接跳过（不是排队——排队等于把突发
+        延后重放，仍然是多余请求）。force=True 供用户显式刷新跳过冷却。
+        """
+        if not self._fetch_gate.try_begin(force=force):
+            return
         t = threading.Thread(target=self._async_refresh, args=(jitter,), daemon=True)
         t.start()
 
     def _async_refresh(self, jitter=False):
         """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
+        try:
+            self._async_refresh_inner(jitter)
+        finally:
+            self._fetch_gate.end()      # 异常路径也必须放闸，否则永久不再刷新
+
+    def _async_refresh_inner(self, jitter=False):
         if jitter:
             # 打破精确节拍：sleep 在后台线程里，不阻塞 UI。
             time.sleep(random.uniform(0, _JITTER_MAX_SEC))
@@ -2102,7 +2259,7 @@ class AiLimitApp(rumps.App):
         # 重建定时器间隔：stop → 改 interval → start（rumps 在 start 时才读取 interval）
         self._auto_timer.stop()
         self._auto_timer.interval = self._refresh_sec()
-        self._auto_timer.start()
+        _start_timer_deferred(self._auto_timer)
         self._update_rate_checks()
 
     def _update_rate_checks(self):
@@ -2209,7 +2366,7 @@ class AiLimitApp(rumps.App):
         _save_state(self._state)
         self._update_bar_checks()
         self._render()
-        self._kick_background_fetch()
+        self._fetch_if_missing(svc)
 
     def _toggle_panel_claude(self, _):
         self._toggle_panel("claude")
@@ -2228,7 +2385,7 @@ class AiLimitApp(rumps.App):
         _save_state(self._state)
         self._update_panel_checks()
         self._render()
-        self._kick_background_fetch()
+        self._fetch_if_missing(svc)
 
     def _toggle_panel_ipsec(self, _):
         on = not self._state.get("ip_security", True)
@@ -2240,6 +2397,32 @@ class AiLimitApp(rumps.App):
             # 重新打开时立刻测一次：10 分钟的节拍太慢，不能让用户开完盯着
             # 一个灰盾牌等下一轮
             self._kick_ip_fetch()
+
+    def _toggle_boardlink(self, _):
+        """桌面小屏供数开关。
+
+        boardlink 绑 0.0.0.0（板子靠 mDNS 发现，绑回环就找不到），意味着同一
+        网络下的设备都能读到额度与套餐档位。在家里这没问题，在咖啡厅/公司网
+        就未必——所以要有一个能立刻关掉的开关：关掉即 stop()，监听 socket 关闭、
+        Bonjour 注销，一个字节都不再对外。
+        """
+        on = not self._state.get("boardlink", True)
+        self._state["boardlink"] = on
+        _save_state(self._state)
+        try:
+            if on:
+                self._boardlink.start()
+            else:
+                self._boardlink.stop()
+        except Exception:
+            pass
+        self._update_boardlink_check()
+
+    def _update_boardlink_check(self):
+        lang = self._lang()
+        on = self._state.get("boardlink", True)
+        self._boardlink_item.title = ("✓ " if on else "  ") + _tr(
+            lang, "桌面小屏供数（局域网）", "Desk display feed (LAN)")
 
     def _make_set_bar_style(self, style):
         return lambda _: self._set_bar_style(style)
@@ -2307,8 +2490,13 @@ class AiLimitApp(rumps.App):
             pass
         # 用户显式要求刷新：清掉指数退避，立即发（不加抖动，用户在等结果）
         self._svc_backoff_until = {"claude": 0.0, "codex": 0.0}
-        # 后台拉，不卡 UI；新数据 ≤几秒内通过 _apply_pending 落到菜单上
-        self._kick_background_fetch()
+        # 状态页有 10 分钟 TTL，用户点了刷新就该拿最新的，否则状态点在 TTL 内
+        # 不会变，看起来像"刷新没生效"
+        for cache in _STATUS_CACHES.values():
+            cache.invalidate()
+        # force=True 跳过冷却（用户显式操作），但并发保护仍在：正在抓时连点
+        # 不会叠加出第二组请求
+        self._kick_background_fetch(force=True)
 
     # ── 检查更新 ──────────────────────────────────────────────────────────────
 

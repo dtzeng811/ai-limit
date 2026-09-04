@@ -138,8 +138,73 @@ check("with_dns=False 跳过 DNS 探针", called["n"], 0)
 
 ipsec.probe_trace, ipsec.probe_iprisk, ipsec.probe_geoip, ipsec.probe_dns = _orig
 
+print("\n【probe() 请求预算：数真实 HTTP，不数函数调用】")
+# 判定链上有两处会问 DNS 出口的国家：is_dns_leaked 一次、给 UI 预存
+# dns_server_countries 又一次。**关键是真实 HTTP 发了几个**——geoip 有缓存，
+# 所以同一个 IP 无论被问几次都只出一次网。这里打桩最底层的 _get 来数。
+_o2 = (ipsec.probe_trace, ipsec.probe_iprisk, ipsec.probe_dns, ipsec._get)
+http_urls = []
+
+
+def _get_spy(url, timeout, as_json=True):
+    http_urls.append(url)
+    return {"country": "United States"}
+
+
+ipsec.probe_trace = lambda *a, **k: (True, {"ip": "1.2.3.4", "loc": "US", "colo": "LAX"})
+ipsec.probe_iprisk = lambda *a, **k: {"country": "United States", "city": "LA",
+                                      "is_abuser": False}
+ipsec.probe_dns = lambda *a, **k: (True, ["8.8.8.8", "9.9.9.9"])
+ipsec._get = _get_spy
+ipsec._geo_cache.clear()
+ipsec._last_ip = None
+_r = ipsec.probe()
+_geo_http = [u for u in http_urls if "/api/geoip/" in u]
+check("2 个 DNS 出口 → 真实 geoip 请求 2 个（缓存吃掉重复）", len(_geo_http), 2)
+check("查的是那两个出口 IP",
+      sorted({u.rsplit("/", 1)[1] for u in _geo_http}), ["8.8.8.8", "9.9.9.9"])
+check("判定结果不变（同国 → 未泄露）", _r["dns_leaked"], False)
+check("国家已预存给 UI（UI 不必再查）",
+      sorted(_r["dns_server_countries"]), ["8.8.8.8", "9.9.9.9"])
+
+# 第二轮 probe：同一批出口 IP 应全部命中缓存，零 geoip 请求
+http_urls.clear()
+_r2 = ipsec.probe()
+check("下一轮同 IP 全部命中缓存 → 0 个 geoip 请求",
+      len([u for u in http_urls if "/api/geoip/" in u]), 0)
+
+# 异国出口仍要正确判为泄露
+http_urls.clear()
+ipsec._geo_cache.clear()
+ipsec._get = lambda url, timeout, as_json=True: (http_urls.append(url),
+                                                 {"country": "China"})[1]
+ipsec._last_ip = None
+_r3 = ipsec.probe()
+check("异国出口仍判泄露", _r3["dns_leaked"], True)
+check("泄露 → 红", _r3["level"], ipsec.SHIELD_CRIT)
+check("泄露态也预存了国家给 UI",
+      set(_r3["dns_server_countries"].values()), {"china"})
+
+ipsec.probe_trace, ipsec.probe_iprisk, ipsec.probe_dns, ipsec._get = _o2
+ipsec._geo_cache.clear()
+
 print("\n【DNS 探针不污染全局 socket 超时（回归护栏）】")
 import socket as _sock, threading as _th
+# 打桩 getaddrinfo：本测试要验的是「全局超时被正确保存/还原」，跟真解析没关系。
+# 打桩前每跑一次会发 14 次真实 DNS 查询——测试套件默认不该访问外部。
+_real_gai = _sock.getaddrinfo
+_gai_calls = []
+
+
+def _fake_gai(host, *a, **k):
+    _gai_calls.append(host)
+    # 记录持锁期间看到的全局超时，用来证明超时确实被设进去了
+    _gai_seen.append(_sock.getdefaulttimeout())
+    raise OSError("stubbed: no such host")
+
+
+_gai_seen = []
+_sock.getaddrinfo = _fake_gai
 _sock.setdefaulttimeout(30)                      # 模拟调用方设过别的超时
 ipsec._resolve_with_timeout("no-such-host.invalid")
 check("解析后还原调用方原值（不是清成 None）", _sock.getdefaulttimeout(), 30)
@@ -158,6 +223,10 @@ _ts = [_th.Thread(target=_hammer) for _ in range(4)]
 [t.start() for t in _ts]; [t.join() for t in _ts]
 check("4 线程并发解析无异常", len(_errs), 0)
 check("并发后无残留污染", _sock.getdefaulttimeout(), None)
+check("解析期间全局超时确实被设成 _DNS_TIMEOUT",
+      set(_gai_seen) == {ipsec._DNS_TIMEOUT}, True)
+check("全程零真实 DNS 查询（测试不访问外部）", _sock.getaddrinfo is _fake_gai, True)
+_sock.getaddrinfo = _real_gai
 
 print("\n" + ("FAILED: " + ", ".join(FAILS) if FAILS else "ALL PASS"))
 sys.exit(1 if FAILS else 0)

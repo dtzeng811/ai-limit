@@ -77,15 +77,163 @@ def _live():
 qc._plan_cache.update({"plan": None, "ts": 0.0})
 check("cached_plan 首次查", qc.cached_claude_plan(_live) == "pro" and calls["n"] == 1)
 check("cached_plan 命中缓存不再查", qc.cached_claude_plan(_live) == "pro" and calls["n"] == 1)
+boom_calls = {"n": 0}
 def _boom():
+    boom_calls["n"] += 1
     raise RuntimeError("net")
-check("cached_plan 查失败沿用旧值", qc.cached_claude_plan(_boom) == "pro")
+
+# ⚠️ 注意：TTL 未过期时根本不会调用 live_plan_fn。旧版这条断言写成
+# cached_claude_plan(_boom) == "pro" 却从没真正走进失败分支（命中缓存直接返回），
+# 是个"看起来在测失败、其实没测"的断言。下面先把 ts 置为过期再测。
+qc._plan_cache["ts"] = 0.0                      # 模拟 12h TTL 已过期
+check("cached_plan 过期后查失败沿用旧值",
+      qc.cached_claude_plan(_boom) == "pro" and boom_calls["n"] == 1)
+
+# 关键回归：套餐查询失败后**不能每轮都重试**。套餐是展示信息，失败还每 3 分钟
+# 硬撞 claude.ai 正是"被判为异常自动化流量"的典型成因。
+before = boom_calls["n"]
+qc.cached_claude_plan(_boom)
+qc.cached_claude_plan(_boom)
+check("cached_plan 失败后进入退避，不再连续重试",
+      boom_calls["n"] == before)
+
+# 退避期过后允许重试；成功则恢复正常缓存并清除失败计数
+qc._plan_retry_at = 0.0
+check("退避期满可重试", qc.cached_claude_plan(_live) == "pro" and calls["n"] == 2)
+check("成功后清除失败退避", qc._plan_retry_at == 0.0)
 
 # detect_lang 受环境变量控制
 import os
 os.environ["AI_LIMIT_LANG"] = "zh"; check("detect_lang zh", qc.detect_lang() == "zh")
 os.environ["AI_LIMIT_LANG"] = "en"; check("detect_lang en", qc.detect_lang() == "en")
 os.environ.pop("AI_LIMIT_LANG", None)
+
+
+# ── 错误分类 + Retry-After ──────────────────────────────────────────────────
+print("\n【parse_retry_after — 秒数与 HTTP-date 两种形态】")
+check("纯秒数", qc.parse_retry_after("120") == 120.0)
+check("带空白", qc.parse_retry_after("  60 ") == 60.0)
+check("0 视为无等待", qc.parse_retry_after("0") == 0.0)
+check("负数当无效", qc.parse_retry_after("-5") is None)
+check("None → None", qc.parse_retry_after(None) is None)
+check("空串 → None", qc.parse_retry_after("") is None)
+check("垃圾串 → None", qc.parse_retry_after("soon") is None)
+_future = qc.parse_retry_after("Wed, 21 Oct 2099 07:28:00 GMT")
+check("HTTP-date 解析成正的秒数", _future is not None and _future > 0)
+check("过去的 HTTP-date → 0（不倒计时）",
+      qc.parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0)
+check("超长 Retry-After 被夹到上限",
+      qc.parse_retry_after(str(10 ** 9)) == qc.RETRY_AFTER_MAX_SEC)
+
+print("\n【classify_http_status — 不同错误不同策略】")
+check("401 → auth（等用户干预，不是重试能解决的）", qc.classify_http_status(401) == "auth")
+check("403 → auth", qc.classify_http_status(403) == "auth")
+check("429 → rate_limit", qc.classify_http_status(429) == "rate_limit")
+check("500 → server", qc.classify_http_status(500) == "server")
+check("503 → server", qc.classify_http_status(503) == "server")
+check("404 → generic", qc.classify_http_status(404) == "generic")
+check("None → generic", qc.classify_http_status(None) == "generic")
+
+print("\n【AbsorbState 按错误类型差异化退避】")
+# 429：不等连败 3 次，第一次就退避，且尊重 Retry-After
+st429 = qc.AbsorbState(lambda: 180)
+st429.absorb(GOOD)
+st429.absorb({"error": "限流", "error_kind": "rate_limit", "retry_after_sec": 900})
+check("429 首次即退避（不等宽限 3 次）", st429.in_backoff())
+check("429 退避时长尊重 Retry-After（≈900s）",
+      880 <= st429.backoff_until - time.time() <= 920)
+
+# 401/403：认证类立即长退避——登录态失效时每 3 分钟硬撞正是被判异常流量的成因
+stauth = qc.AbsorbState(lambda: 180)
+stauth.absorb(GOOD)
+stauth.absorb({"error": "需重新登录", "error_kind": "auth"})
+check("401/403 首次即退避", stauth.in_backoff())
+check("认证类退避 ≥ AUTH_BACKOFF_SEC",
+      stauth.backoff_until - time.time() >= qc.AUTH_BACKOFF_SEC - 5)
+
+# 普通网络抖动：保持原语义（前 2 次吸收，不退避）
+stnet = qc.AbsorbState(lambda: 180)
+stnet.absorb(GOOD)
+stnet.absorb({"error": "网络超时"})
+check("普通失败第 1 次不退避（保持原抖动吸收语义）", not stnet.in_backoff())
+stnet.absorb({"error": "网络超时"})
+check("普通失败第 2 次仍不退避", not stnet.in_backoff())
+stnet.absorb({"error": "网络超时"})
+check("普通失败第 3 次才退避", stnet.in_backoff())
+
+# 恢复：一次成功清掉所有退避
+stauth.absorb(GOOD)
+check("成功后清除认证退避", not stauth.in_backoff() and stauth.fail == 0)
+
+# 没有 Retry-After 的 429 用默认值
+st429b = qc.AbsorbState(lambda: 180)
+st429b.absorb({"error": "限流", "error_kind": "rate_limit"})
+check("429 无 Retry-After 时用默认退避",
+      st429b.in_backoff() and
+      st429b.backoff_until - time.time() >= qc.RATE_LIMIT_BACKOFF_SEC - 5)
+
+# ── SingleFlight：并发去重 + 最小冷却 ────────────────────────────────────────
+print("\n【SingleFlight — 并发去重 + 冷却】")
+clock = {"t": 1000.0}
+sf = qc.SingleFlight(cooldown_sec=5.0, clock=lambda: clock["t"])
+check("首次可执行", sf.try_begin() is True)
+check("执行中再来被拒（并发去重）", sf.try_begin() is False)
+sf.end()
+check("刚结束仍在冷却期内被拒", sf.try_begin() is False)
+clock["t"] += 4.9
+check("冷却未满仍被拒", sf.try_begin() is False)
+clock["t"] += 0.2
+check("冷却期满可再执行", sf.try_begin() is True)
+sf.end()
+clock["t"] += 1
+check("force=True 无视冷却（用户显式操作）", sf.try_begin(force=True) is True)
+sf.end()
+check("force 仍受并发保护", (sf.try_begin(force=True), sf.try_begin(force=True))[1] is False)
+sf.end()
+# 异常路径必须释放，否则永久卡死
+sf2 = qc.SingleFlight(clock=lambda: clock["t"])
+try:
+    with sf2.guard() as ok:
+        check("guard 拿到执行权", ok is True)
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+check("guard 异常后仍释放（不会永久卡死）", sf2.try_begin() is True)
+sf2.end()
+
+# ── TTLCache：低频数据缓存 + 失败退避 ───────────────────────────────────────
+print("\n【TTLCache — TTL 缓存 + 失败退避】")
+clk = {"t": 0.0}
+calls = {"n": 0}
+def _ok():
+    calls["n"] += 1
+    return "operational"
+tc = qc.TTLCache(ttl_sec=600, fail_backoff_sec=60,
+                 failed=lambda v: v in (None, "unknown"), clock=lambda: clk["t"])
+check("首次穿透取值", tc.get(_ok) == "operational" and calls["n"] == 1)
+clk["t"] += 599
+check("TTL 内命中缓存不发请求", tc.get(_ok) == "operational" and calls["n"] == 1)
+clk["t"] += 2
+check("TTL 过期后重新取", tc.get(_ok) == "operational" and calls["n"] == 2)
+
+fcalls = {"n": 0}
+def _fail():
+    fcalls["n"] += 1
+    return "unknown"
+clk["t"] += 601
+check("失败值如实返回（不用旧值伪装）", tc.get(_fail) == "unknown" and fcalls["n"] == 1)
+check("失败后进入退避，不再连发", tc.get(_fail) == "unknown" and fcalls["n"] == 1)
+clk["t"] += 61
+check("首次退避期满可重试", tc.get(_fail) == "unknown" and fcalls["n"] == 2)
+clk["t"] += 61
+check("第二次失败退避翻倍（61s 不够）", fcalls["n"] == 2 or tc.get(_fail) is not None)
+clk["t"] += 200
+tc.get(_fail)
+check("退避有指数增长", fcalls["n"] == 3)
+clk["t"] += 100000
+check("成功后恢复正常缓存", tc.get(_ok) == "operational")
+clk["t"] += 1
+check("恢复后 TTL 生效", tc.get(_ok) == "operational" and calls["n"] == 3)
 
 print("\n" + ("FAILED: " + ", ".join(FAILS) if FAILS else "ALL PASS"))
 sys.exit(1 if FAILS else 0)

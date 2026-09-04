@@ -29,7 +29,7 @@ _CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 _MENUBAR_HISTORY_PATH = pathlib.Path.home() / ".ai-limit-menubar-history.jsonl"
 TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
 TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
-__version__ = "0.3.23+fork.13"
+__version__ = "0.3.23+fork.14"
 
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
@@ -261,10 +261,17 @@ def _cookie_summary(cookie_header: str) -> dict:
 
 
 class ClaudeWebError(Exception):
-    """kind: 'generic' | 'cloudflare'（需人机验证）| 'auth'（登录失效）| 'timeout'"""
-    def __init__(self, message, kind="generic"):
+    """kind: 'generic' | 'cloudflare'（需人机验证）| 'auth'（登录失效）|
+    'rate_limit'（429）| 'timeout'
+
+    status / retry_after 供上层做差异化退避：服务端说了等多久就等多久，
+    401/403/429 不该按原节奏继续撞（见 quotacore.classify_http_status）。
+    """
+    def __init__(self, message, kind="generic", status=None, retry_after=None):
         super().__init__(message)
         self.kind = kind
+        self.status = status
+        self.retry_after = retry_after
 
 
 def _claude_web_context(referer: str) -> tuple[str, dict]:
@@ -376,7 +383,10 @@ def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
             low = raw.lower()
             is_cf = any(m in low for m in (
                 "just a moment", "challenge-platform", "/cdn-cgi/", "请验证您是真人"))
-        kind = "cloudflare" if is_cf else ("auth" if e.code in (401, 403) else "generic")
+        _ra = e.headers.get("Retry-After") if e.headers else None
+        kind = ("cloudflare" if is_cf else
+                "auth" if e.code in (401, 403) else
+                "rate_limit" if e.code == 429 else "generic")
         # 记录现场，事后区分根因：瞬时 403 / 真 Cloudflare 挑战 / cookie 残缺
         _diag_log("claude_web_http_error", {
             "path": path,
@@ -393,13 +403,19 @@ def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
                 "claude.ai 触发了 Cloudflare 人机验证，请在浏览器打开 claude.ai 通过验证后重试",
                 "claude.ai is showing a Cloudflare human-verification challenge; "
                 "open claude.ai in your browser, pass it, then retry",
-            ), kind="cloudflare")
+            ), kind="cloudflare", status=e.code, retry_after=_ra)
         if e.code in (401, 403):
             raise ClaudeWebError(t(
                 "claude.ai 登录态已失效，请在浏览器重新登录",
                 "claude.ai session expired, please re-login in your browser",
-            ), kind="auth")
-        raise ClaudeWebError(f"HTTP {e.code}: {raw[:300]}")
+            ), kind="auth", status=e.code, retry_after=_ra)
+        if e.code == 429:
+            raise ClaudeWebError(t(
+                "claude.ai 请求过于频繁，已自动降低频率",
+                "claude.ai rate-limited; backing off automatically",
+            ), kind="rate_limit", status=e.code, retry_after=_ra)
+        raise ClaudeWebError(f"HTTP {e.code}: {raw[:300]}",
+                             status=e.code, retry_after=_ra)
     except Exception as e:
         raise ClaudeWebError(str(e))
 
@@ -830,13 +846,22 @@ def _recv_exact(s: socket.socket, n: int) -> bytes:
 
 
 class CodexWebError(Exception):
-    pass
+    """kind / status / retry_after 同 ClaudeWebError，供上层差异化退避。"""
+    def __init__(self, message, kind="generic", status=None, retry_after=None):
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+        self.retry_after = retry_after
 
 
 class CodexAuthError(CodexWebError):
     """401 / 403：未登录 ChatGPT 或无 Codex 权限（可能未订阅）。
-    捕获后应直接跳过所有 fallback，app-server 也会因同样原因失败。"""
-    pass
+    捕获后应直接跳过所有 fallback，app-server 也会因同样原因失败。
+
+    默认 kind="auth"：登录态问题重试解决不了，上层据此立即长退避，而不是
+    每 3 分钟继续撞到用户重新登录为止。"""
+    def __init__(self, message, kind="auth", status=None, retry_after=None):
+        super().__init__(message, kind=kind, status=status, retry_after=retry_after)
 
 
 def _load_chatgpt_cookies():
@@ -990,6 +1015,12 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                 body = r.read()
             break
         except urllib.error.HTTPError as e:
+            _ra = e.headers.get("Retry-After") if e.headers else None
+            if e.code == 429:
+                raise CodexWebError(t(
+                    "ChatGPT 请求过于频繁，已自动降低频率",
+                    "ChatGPT rate-limited; backing off automatically",
+                ), kind="rate_limit", status=429, retry_after=_ra)
             if e.code in (401, 403):
                 # 缓存 token 可能刚被服务端吊销：强刷换新 token 重试一次，
                 # 仍失败才判定为真·无权限。新换的 token 失败则不重试。
@@ -1018,7 +1049,7 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                         f"HTTP {e.code}: no Codex access (subscription may be required)",
                     )
                 )
-            raise CodexWebError(f"HTTP {e.code}")
+            raise CodexWebError(f"HTTP {e.code}", status=e.code, retry_after=_ra)
         except Exception as e:
             raise CodexWebError(str(e))
     try:
@@ -1383,7 +1414,10 @@ def render_codex(since: datetime.datetime):
     ts, rl, source, fallback_reason = current_codex_rate_limits()
     if not rl:
         if source == "no_access":
-            print(f"  {_WARN}{t('未检测到 Codex 权限', 'No Codex access detected')}{_RST}")
+            # 变量名是 _WRN（黄色 ANSI 码），不是 _WARN——写错的那个名字模块里
+            # 根本不存在，这一整条「无 Codex 权限」分支一走到就 NameError 崩掉。
+            # 平时走不到，所以一直没被发现；tests/test_static_checks.py 现在守着。
+            print(f"  {_WRN}{t('未检测到 Codex 权限', 'No Codex access detected')}{_RST}")
             print(f"  {_DIM}{fallback_reason}{_RST}")
         else:
             if fallback_reason:

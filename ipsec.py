@@ -87,11 +87,32 @@ def probe_iprisk(ip, timeout=_API_TIMEOUT):
         return None
 
 
+# geoip 结果缓存：DNS 出口 IP 与本机出口 IP 都是长期稳定的，每轮重查一遍
+# 纯属浪费。失败也缓存（较短 TTL），避免整站挂掉时每轮都重试一遍所有 IP。
+_GEO_TTL_OK   = 6 * 3600
+_GEO_TTL_FAIL = 10 * 60
+_geo_cache = {}
+_geo_lock = threading.Lock()
+
+
 def probe_geoip(ip, timeout=_API_TIMEOUT):
-    try:
-        return _get(f"{_API_BASE}/api/geoip/{ip}", timeout)
-    except Exception:
+    if not ip:
         return None
+    now = time.time()
+    with _geo_lock:
+        hit = _geo_cache.get(ip)
+        if hit and now < hit[0]:
+            return hit[1]
+    try:
+        data = _get(f"{_API_BASE}/api/geoip/{ip}", timeout)
+    except Exception:
+        data = None
+    with _geo_lock:
+        _geo_cache[ip] = (now + (_GEO_TTL_OK if data else _GEO_TTL_FAIL), data)
+        if len(_geo_cache) > 256:        # 有界：DNS 出口 IP 数量有限，不会真涨到这
+            for k in [k for k, v in _geo_cache.items() if v[0] < now][:128]:
+                _geo_cache.pop(k, None)
+    return data
 
 
 # ── 探针 3：DNS 泄露 ─────────────────────────────────────────────────────────
@@ -153,7 +174,7 @@ def _norm_country(v):
     return (v or "").strip().lower()
 
 
-def decide(*, reachable, risk, dns_ok, dns_servers, ip_changed):
+def decide(*, reachable, risk, dns_ok, dns_servers, ip_changed, dns_leaked=None):
     """把探针结果合成盾牌档位。合并取最差。
 
     红：claude.ai 不可达 / DNS 真泄露 / IP 被标记 abuser
@@ -162,12 +183,17 @@ def decide(*, reachable, risk, dns_ok, dns_servers, ip_changed):
 
     机房 IP（is_datacenter）**不点亮盾牌**——用户长期走机房出口，若据此常亮
     黄灯则告警失去意义；它只在卡片里以标签注明。
+
+    dns_leaked 已经算过就传进来：判定 DNS 出口国家要给每个出口 IP 查一次
+    geoip，probe() 里算一次、decide() 再算一次的话，这些请求就发了两遍。
     """
     if not reachable:
         return SHIELD_CRIT
     if risk and risk.get("is_abuser"):
         return SHIELD_CRIT
-    if dns_ok and is_dns_leaked(risk, dns_ok, dns_servers):
+    if dns_leaked is None:
+        dns_leaked = is_dns_leaked(risk, dns_ok, dns_servers)
+    if dns_ok and dns_leaked:
         return SHIELD_CRIT
     if ip_changed:
         return SHIELD_WARN
@@ -240,6 +266,7 @@ def probe(*, with_dns=True):
         "is_datacenter": False, "is_vpn": False, "is_proxy": False,
         "is_tor": False, "is_abuser": False, "abuser_score": None,
         "dns_ok": False, "dns_servers": [], "dns_leaked": False,
+        "dns_server_countries": {},
         "ip_changed": False, "checked_at": time.time(),
     }
 
@@ -277,11 +304,20 @@ def probe(*, with_dns=True):
         dns_ok, servers = probe_dns()
         out["dns_ok"], out["dns_servers"] = dns_ok, servers
         out["dns_leaked"] = is_dns_leaked(risk, dns_ok, servers)
+        # 把每个出口的国家一并算好带上：UI 层此前是在**主线程渲染时**逐个
+        # 调 dns_server_country() 现查 geoip（12 秒超时 × N 个 IP），每次面板
+        # 重绘都来一遍，网络一慢界面就卡死。判定阶段已经查过了，缓存命中，
+        # 这里几乎零成本。
+        if dns_ok and servers:
+            out["dns_server_countries"] = {
+                dns_server_ip(sv): dns_server_country(sv) for sv in servers
+            }
 
     out["level"] = decide(
         reachable=reachable, risk=risk,
         dns_ok=out["dns_ok"], dns_servers=out["dns_servers"],
         ip_changed=out["ip_changed"],
+        dns_leaked=out["dns_leaked"],      # 复用上面算好的，别再查一轮 geoip
     )
     return out
 

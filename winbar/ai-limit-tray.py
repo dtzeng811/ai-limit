@@ -291,6 +291,23 @@ def _autotest_fake() -> bool:
     return os.environ.get("AI_LIMIT_AUTOTEST_FAKE", "").strip() == "1"
 
 
+def _err(msg, exc=None):
+    """与 menubar._err 同语义：错误字典带上退避分类与 Retry-After，
+    交给 quotacore.AbsorbState 做差异化退避（三端保持一致）。"""
+    d = {"error": msg}
+    if exc is None:
+        return d
+    kind = getattr(exc, "kind", "generic")
+    if kind == "cloudflare":
+        kind = "auth"
+    if kind in ("auth", "rate_limit"):
+        d["error_kind"] = kind
+    ra = quotacore.parse_retry_after(getattr(exc, "retry_after", None))
+    if ra:
+        d["retry_after_sec"] = ra
+    return d
+
+
 def fetch_claude():
     if _autotest_fake():
         return {"5h_left": 88, "7d_left": 52,
@@ -317,10 +334,10 @@ def fetch_claude():
     except ClaudeWebError as e:
         kind = getattr(e, "kind", "generic")
         if kind == "cloudflare":
-            return {"error": tr("被拦截，打开用量页勿关", "Blocked; open claude.ai usage page, keep it open")}
+            return _err(tr("被拦截，打开用量页勿关", "Blocked; open claude.ai usage page, keep it open"), e)
         if kind == "auth":
-            return {"error": tr("需在浏览器重新登录 claude.ai", "Re-login at claude.ai in browser")}
-        return {"error": str(e)}
+            return _err(tr("需在浏览器重新登录 claude.ai", "Re-login at claude.ai in browser"), e)
+        return _err(str(e), e)
     except (socket.timeout, TimeoutError):
         return {"error": tr("网络超时", "Network timeout")}
     except urllib.error.URLError:
@@ -349,7 +366,7 @@ def fetch_codex():
         }
     except CodexAuthError as e:
         # 透传数据层的具体原因（已区分「登录态过期」与「无订阅」，自带 i18n）
-        return {"error": str(e)}
+        return _err(str(e), e)
     except CodexWebError as e:
         msg = str(e)
         if "timed out" in msg or "urlopen" in msg:
@@ -566,10 +583,13 @@ def ip_dns_text(d):
     - dns_ok=False      → 本轮没测到，既不能报安全也不能报泄露
     """
     if d.get("dns_leaked"):
-        # dns_servers 实际是纯 IP 字符串数组，国家要另查——统一走 ipsec 的
-        # 归一化取值（早期这里按 dict 假设写 s.get()，非空时直接抛异常）
-        names = [(ipsec.dns_server_country(s) or "?").title()
-                 for s in (d.get("dns_servers") or [])]
+        # 只读 probe() 算好的国家，绝不在渲染路径上现查 geoip（见 menubar 同处注释）
+        cmap = d.get("dns_server_countries") or {}
+        names = []
+        for sv in (d.get("dns_servers") or []):
+            ip_ = ipsec.dns_server_ip(sv)
+            c = (cmap.get(ip_) or "").strip()
+            names.append(c.title() if c else (ip_ or "?"))
         # 只报出口在哪国——"与本机不同国"这层意思由红色 + 泄露标签承担，
         # 一行 190px 塞不下完整句子
         return (tr("出口在 ", "Resolver in ") + "/".join(names[:2]),

@@ -11,6 +11,7 @@
 import contextlib as _contextlib
 import locale as _locale
 import os
+import re as _re
 import threading as _threading
 import time
 
@@ -283,6 +284,53 @@ def ip_failed(d) -> bool:
 def make_ip_state(refresh_sec_fn) -> AbsorbState:
     """IP 安全检测专用的 AbsorbState（40 分钟过期 + degraded 不算失败）。"""
     return AbsorbState(refresh_sec_fn, stale_max=IPSEC_STALE_MAX_SEC, failed=ip_failed)
+
+
+# ── 更新检查：版本比较 + 节流 ────────────────────────────────────────────────
+#
+# fork 版有自己的发版节奏（tag 形如 v0.3.23-fork.14，__version__ 形如
+# 0.3.23+fork.14），装了 fork 的人要跟的是 fork 仓库而不是上游。
+UPDATE_CHECK_TTL_SEC = 24 * 3600   # 每天最多查一次 Release（GitHub 匿名 API 60 次/小时）
+
+
+def version_tuple(v):
+    """版本字符串 → 可比较的整数元组。
+
+    每段只取前导数字，取不到记 0。这样 "0.3.23-fork.14"（tag 写法）与
+    "0.3.23+fork.14"（__version__ 写法）都会得到 (0, 3, 23, 14)——两种写法
+    必须等值，否则永远比不出新版。预发布后缀（-rc1 / -dev）同理不会抛异常。
+    """
+    out = []
+    for part in str(v or "").lstrip("vV").split("."):
+        m = _re.match(r"\d+", part)
+        out.append(int(m.group()) if m else 0)
+    return tuple(out) if out else (0,)
+
+
+def is_newer_version(latest, current):
+    """远端版本是否严格新于当前版本。空/无效的 latest 一律判为「不新」——
+    拿不准就不提示，比误报一个不存在的更新好。"""
+    if not latest:
+        return False
+    return version_tuple(latest) > version_tuple(current)
+
+
+def update_due(last_check_ts, now=None, ttl_sec=UPDATE_CHECK_TTL_SEC):
+    """距上次检查是否已超过 TTL。
+
+    时钟回拨或状态文件被改坏（last 是未来时刻 / 不是数字）时返回 True：
+    宁可多查一次，也不能让「下次检查」永远不到来而彻底失去更新提醒。
+    """
+    if not last_check_ts:
+        return True                    # 从未查过：与"过了多久"无关，直接该查
+    now = time.time() if now is None else now
+    try:
+        last = float(last_check_ts)
+    except (TypeError, ValueError):
+        return True
+    if last > now:
+        return True
+    return (now - last) >= ttl_sec
 
 
 # ── 纯函数：套餐名缓存 / 窗口短标签 / locale ─────────────────────────────────

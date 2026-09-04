@@ -370,6 +370,108 @@ check("再开回来重新监听", sb._boardlink.port is not None, True)
 sb._boardlink.stop()
 app._save_state = _orig_save
 
+# ── 更新提醒：指向 fork、每天最多一次、每版只通知一次 ───────────────────────
+print("\n【更新提醒】")
+check("更新源指向 fork 仓库而不是上游",
+      "dtzeng811/ai-limit" in app._RELEASES_API_URL, True)
+check("下载页也指向 fork", "dtzeng811/ai-limit" in app._RELEASES_PAGE_URL, True)
+check("Gitee 兜底已移除（它指向上游）", app._GITEE_RELEASES_API_URL, None)
+check("未公证的包不走一键安装", app._AUTO_INSTALL_ENABLED, False)
+
+
+class _StubUpd:
+    """只带更新检查需要的字段；不启动 rumps。"""
+    def __init__(self, **st):
+        self._state = {"update_check": True, "last_update_check": 0.0,
+                       "update_seen": "", "update_notified": "",
+                       "lang": "zh", **st}
+        self._updating = False
+        self._update_checking = False
+        self._update_lock = __import__("threading").Lock()
+        self._update_pending = None
+        self._update_gate = quotacore.SingleFlight(0)
+        self.kicked = []
+        self.notified = []
+        self.title = ""
+
+    def _lang(self):
+        return "zh"
+
+    def _kick_update_check(self, manual=False):
+        self.kicked.append(manual)
+
+    def _notify_update(self, latest):
+        self.notified.append(latest)
+
+    class _Item:
+        title = ""
+    _check_update_item = _Item()
+
+    _maybe_auto_check_update = app.AiLimitApp._maybe_auto_check_update
+    _show_update_result = app.AiLimitApp._show_update_result
+    _update_check_item_title = app.AiLimitApp._update_check_item_title
+
+
+_saved_upd = {"n": 0}
+_orig_save2 = app._save_state
+app._save_state = lambda st: _saved_upd.__setitem__("n", _saved_upd["n"] + 1)
+
+# 关掉开关 → 一个请求都不发
+u = _StubUpd(update_check=False)
+u._maybe_auto_check_update()
+check("关掉自动检查 → 不发请求", u.kicked, [])
+
+# 打开且从未查过 → 查
+u = _StubUpd()
+u._maybe_auto_check_update()
+check("从未查过 → 触发一次自动检查", u.kicked, [False])
+
+# 刚查过 → 不再查（每天最多一次）
+import time as _t4
+u = _StubUpd(last_update_check=_t4.time())
+u._maybe_auto_check_update()
+check("24 小时内不再查", u.kicked, [])
+
+# 结果处理：有新版 → 记状态 + 通知一次 + 菜单变红点
+u = _StubUpd()
+u._show_update_result({"latest": "0.3.99-fork.1", "manual": False})
+check("记下已知最新版", u._state["update_seen"], "0.3.99-fork.1")
+check("记下检查时刻（失败/成功都记，避免每轮重试）",
+      u._state["last_update_check"] > 0, True)
+check("自动检查弹一次通知", u.notified, ["0.3.99-fork.1"])
+u._update_check_item_title()
+check("菜单标题变成醒目提醒", "🔴" in u._check_update_item.title
+      and "0.3.99-fork.1" in u._check_update_item.title, True)
+
+# 同一版本再来一轮 → 不重复通知
+u._show_update_result({"latest": "0.3.99-fork.1", "manual": False})
+check("同一版本不重复通知（装着不升的人不该天天被弹）", u.notified, ["0.3.99-fork.1"])
+
+# 更新的版本出现 → 再通知一次
+u._show_update_result({"latest": "0.3.99-fork.2", "manual": False})
+check("出现更新的版本 → 再通知一次", u.notified,
+      ["0.3.99-fork.1", "0.3.99-fork.2"])
+
+# 已是最新 → 不通知、标题回落
+u2 = _StubUpd()
+u2._show_update_result({"latest": app.__version__.replace("+", "-"), "manual": False})
+check("已是最新不通知", u2.notified, [])
+u2._update_check_item_title()
+check("已是最新时标题不带红点", "🔴" not in u2._check_update_item.title, True)
+
+# 旧版本（降级）不该提示
+u3 = _StubUpd()
+u3._show_update_result({"latest": "0.0.1", "manual": False})
+check("远端是旧版时不提示", u3.notified, [])
+
+# 检查失败也要记时间戳，否则会每轮重试
+u4 = _StubUpd()
+u4._show_update_result({"error": True, "manual": False})
+check("检查失败也记时间戳（不每轮硬撞）", u4._state["last_update_check"] > 0, True)
+check("检查失败不通知", u4.notified, [])
+
+app._save_state = _orig_save2
+
 # ── 全天请求量对照（假时钟推进真实时间，否则 TTL 永不过期，数字是假的）──────
 print("\n【默认配置每天请求量（假时钟推进 24 小时）】")
 ROUNDS_PER_DAY = 24 * 20                  # 3 分钟一轮

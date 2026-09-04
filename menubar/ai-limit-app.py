@@ -188,16 +188,31 @@ _STATUS_CHECKBOX_LABEL = {
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _EN_RESET_PAD  = 8
-_PROJECT_URL   = "https://github.com/zhuchenxi113/ai-limit"
+_UPSTREAM_URL  = "https://github.com/zhuchenxi113/ai-limit"   # 原作者仓库，仅「关于」里致谢用
 _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
-_RELEASES_API_URL  = "https://api.github.com/repos/zhuchenxi113/ai-limit/releases/latest"
+
+# ── 更新源：指向 **fork 仓库自己**，不是上游 ──────────────────────────────────
+# 装了 fork 版的人要跟的是 fork 的发版节奏。指向上游会有两个后果：
+# 1. 上游发版时提示"有新版"，但那个版本没有 fork 的任何改动
+# 2. 真去装就会用上游的官方 DMG 覆盖掉 fork 版，改动全丢
+# 这也是此前整个「检查更新」入口被摘掉的原因——现在源头改对了，可以放回来。
+_FORK_REPO     = "dtzeng811/ai-limit"
+_PROJECT_URL   = f"https://github.com/{_FORK_REPO}"
+_RELEASES_API_URL  = f"https://api.github.com/repos/{_FORK_REPO}/releases/latest"
 _RELEASES_PAGE_URL = _PROJECT_URL + "/releases"
-# Gitee 国内可直连，作为 GitHub 连不上时（常见于未配代理的用户）的兜底。
-# 注意：Gitee 官方 /releases/latest 接口实测有 bug，返回的不是真正最新版
-# （曾返回 v0.3.10 而实际最新是 v0.3.11）；改用列表按创建时间倒序取第一条才准确。
-_GITEE_RELEASES_API_URL  = "https://gitee.com/api/v5/repos/zhuchenxi113/ai-limit/releases?per_page=1&direction=desc"
-_GITEE_RELEASES_PAGE_URL = "https://gitee.com/zhuchenxi113/ai-limit/releases"
+# fork 没有 Gitee 镜像。原先的 Gitee 兜底指向上游，留着只会把上游版本当成
+# "最新版"报给用户——正是这次要消除的问题，所以整条兜底去掉。
+_GITEE_RELEASES_API_URL  = None
+_GITEE_RELEASES_PAGE_URL = None
+
+# fork 的 DMG 只有 adhoc 签名、未经 Apple 公证（无开发者账号），一键更新里的
+# stapler/spctl 校验对它**必然失败**。让用户点"立即更新"、等 32MB 下载完再
+# 被拒，比不给这个按钮更糟。所以 fork 版只做"提醒 + 打开下载页"，把安装这一步
+# 交回给用户。将来真去公证了，把这个开关打开即可恢复一键更新。
+_AUTO_INSTALL_ENABLED = False
+
+_UPDATE_CHECK_TTL_SEC = quotacore.UPDATE_CHECK_TTL_SEC
 # 一键更新：只测试用，指向本地 file:// JSON，覆盖 GitHub/Gitee 两个真实源，
 # 用于 Stage 3 端到端联调（不依赖真实公开 Release）。生产环境不设置这个变量。
 _RELEASE_FEED_OVERRIDE = os.environ.get("AI_LIMIT_RELEASE_FEED_OVERRIDE")
@@ -317,11 +332,7 @@ def _fetch_latest_release_info(timeout=6) -> dict:
     except Exception:
         pass
 
-    try:
-        data = _get_json(_GITEE_RELEASES_API_URL)
-        return _result(data[0]["tag_name"].lstrip("v"), "gitee", data[0].get("assets"))
-    except Exception:
-        return {"error": True}
+    return {"error": True}
 
 # ── 一键更新：下载 + 签名公证校验 ────────────────────────────────────────────
 # 这两个函数故意设计成不依赖 self，可以脱离整个 rumps App 独立测试
@@ -643,6 +654,12 @@ def _load_state():
              # 桌面小屏供数：默认开（保持既有行为）。在不可信网络（咖啡厅、
              # 公司网）下可以一键关掉——关掉即停服务、注销 Bonjour、不再监听
              "boardlink": True,
+             # 更新提醒：每天最多查一次 fork 仓库的最新 Release。关掉则一个
+             # 请求都不发（对齐"服务关闭后停止对应请求"）。
+             "update_check": True,
+             "last_update_check": 0.0,   # 上次查询时刻，重启后不重查
+             "update_seen": "",          # 已知的最新版本号（菜单据此显示红点）
+             "update_notified": "",      # 已经弹过通知的版本，避免每天重复打扰
              "claude_status_components": list(_CLAUDE_STATUS_DEFAULT),  # 允许全空=不显示状态点
              "codex_status_components": list(_CODEX_STATUS_DEFAULT)}
     try:
@@ -686,6 +703,13 @@ def _load_state():
                 state["ip_security"] = raw["ip_security"]
             if isinstance(raw.get("boardlink"), bool):
                 state["boardlink"] = raw["boardlink"]
+            if isinstance(raw.get("update_check"), bool):
+                state["update_check"] = raw["update_check"]
+            if isinstance(raw.get("last_update_check"), (int, float)):
+                state["last_update_check"] = float(raw["last_update_check"])
+            for k in ("update_seen", "update_notified"):
+                if isinstance(raw.get(k), str):
+                    state[k] = raw[k]
             if isinstance(raw.get("claude_status_components"), list):
                 state["claude_status_components"] = [
                     c for c in raw["claude_status_components"] if c in _CLAUDE_STATUS_ALL]
@@ -1357,6 +1381,7 @@ class AiLimitApp(rumps.App):
         self._fetch_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._ip_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._forecast_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
+        self._update_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._build_menu()
         # 自动刷新定时器手动管理（间隔可在运行时按用户选择的频率重建），
         # 不用 @rumps.timer 装饰器——那是静态绑定，改不了间隔。
@@ -1607,13 +1632,17 @@ class AiLimitApp(rumps.App):
         )
         self._about_menu.add(self._about_ver)
         self._about_menu.add(self._about_author)
-        # self._about_menu.add(self._check_update_item)  # fork 版禁用，见上
+        # 更新入口不放进「关于」子菜单——藏两层的提醒等于没有提醒。改放顶层，
+        # 有新版时标题直接变成「🔴 发现新版本 …」，展开菜单一眼就看得到。
 
         # Star on GitHub（放在关于子菜单里，_about_menu 之后才 add）
         self._star_item = rumps.MenuItem(
             "⭐ 给个 Star，鼓励作者" if lang == "zh" else "⭐ Star on GitHub — support the author",
             callback=lambda _: webbrowser.open(_PROJECT_URL),
         )
+        self._auto_update_item = rumps.MenuItem(
+            "", callback=self._toggle_update_check)
+        self._about_menu.add(self._auto_update_item)
         self._about_menu.add(self._star_item)
         self._about_menu.add(self._about_desc)
         self._about_menu.add(self._about_src)
@@ -1645,6 +1674,7 @@ class AiLimitApp(rumps.App):
             self._claude_dash,
             self._codex_dash,
             None,
+            self._check_update_item,
             self._about_menu,
             None,
             self._quit_item,
@@ -1657,6 +1687,8 @@ class AiLimitApp(rumps.App):
         self._update_bar_checks()
         self._update_panel_checks()
         self._update_boardlink_check()
+        self._update_auto_update_check()
+        self._update_check_item_title()   # 上次会话已发现的新版，开菜单就能看到
         self._update_rate_checks()
         self._update_status_checks()
 
@@ -1933,6 +1965,7 @@ class AiLimitApp(rumps.App):
         self._kick_background_fetch()
         self._kick_ip_fetch()
         self._auto_forecast_refresh()   # 预告首轮：不等 30 分钟节拍
+        self._maybe_auto_check_update() # 更新检查：距上次满 24 小时才真的查
         self._check_update_failure_marker()
         # 仅测试用：Stage 3 端到端联调没有人工点"检查更新"菜单项的手段，
         # 用同一个 autotest 环境变量在启动后自动触发一次，和上面跳过确认弹窗
@@ -1969,6 +2002,9 @@ class AiLimitApp(rumps.App):
         )
 
     def _auto_refresh(self, _):
+        # 顺带评估"今天查过更新了吗"。只做时间戳比较，到期（默认 24 小时）
+        # 才真发一次请求——不用额外定时器，也不会因为 App 常驻就反复查。
+        self._maybe_auto_check_update()
         """按用户选择的频率后台拉一次（由 self._auto_timer 驱动，间隔可调）。
         自动刷新带随机抖动；手动"立即刷新"不带（用户在等结果）。"""
         self._kick_background_fetch(jitter=True)
@@ -2011,8 +2047,8 @@ class AiLimitApp(rumps.App):
             self._update_pending = None
         if update_result is not None:
             self._update_checking = False
-            self._check_update_item.title = _tr(self._lang(), "检查更新", "Check for Updates")
             self._show_update_result(update_result)
+            self._update_check_item_title()
 
         with self._download_lock:
             download_result = self._download_pending
@@ -2043,9 +2079,10 @@ class AiLimitApp(rumps.App):
             cancel=_tr(lang, "取消", "Cancel"),
         )
         if opened:
-            page_url = (_GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee"
-                        else _RELEASES_PAGE_URL)
-            webbrowser.open(page_url)
+            # 永远打开**硬编码**的 fork Releases 页，不用 feed 里带回来的任何
+            # URL——这样即使 feed 被污染或被 override，也只能让菜单多显示一个
+            # "有新版"，无法把用户导去别处
+            webbrowser.open(_RELEASES_PAGE_URL)
 
     def _absorb_fetch(self, svc, new, cur):
         """抖动抑制：决定这次抓取结果要不要真的替换掉当前显示的数据。
@@ -2323,7 +2360,7 @@ class AiLimitApp(rumps.App):
             "Source: local logs + official web endpoints",
         )
         if not self._update_checking:
-            self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
+            self._update_check_item_title()
         self._update_login_item_check()
         self._update_status_checks()
         self._update_rate_checks()
@@ -2418,6 +2455,21 @@ class AiLimitApp(rumps.App):
             pass
         self._update_boardlink_check()
 
+    def _toggle_update_check(self, _):
+        """自动检查更新开关。关掉后一个请求都不发（菜单里仍可手动点检查）。"""
+        on = not self._state.get("update_check", True)
+        self._state["update_check"] = on
+        _save_state(self._state)
+        self._update_auto_update_check()
+        if on:
+            self._maybe_auto_check_update()
+
+    def _update_auto_update_check(self):
+        lang = self._lang()
+        on = self._state.get("update_check", True)
+        self._auto_update_item.title = ("✓ " if on else "  ") + _tr(
+            lang, "每天自动检查更新", "Check for updates daily")
+
     def _update_boardlink_check(self):
         lang = self._lang()
         on = self._state.get("boardlink", True)
@@ -2500,80 +2552,147 @@ class AiLimitApp(rumps.App):
 
     # ── 检查更新 ──────────────────────────────────────────────────────────────
 
+    def _update_check_item_title(self):
+        """菜单项标题：平时是「检查更新」，已知有新版时换成醒目的一行。
+
+        这是"点开菜单就知道该更新了"的那个入口——所以标题里直接带版本号，
+        用户不用再点进去问一次。
+        """
+        lang = self._lang()
+        seen = self._state.get("update_seen") or ""
+        if seen and quotacore.is_newer_version(seen, __version__):
+            self._check_update_item.title = _tr(
+                lang, f"🔴 发现新版本 {seen} — 点击下载",
+                f"🔴 Update available {seen} — click to download")
+        else:
+            self._check_update_item.title = _tr(lang, "检查更新", "Check for Updates")
+
     def _check_for_updates(self, _):
-        if self._update_checking or self._updating:
+        """用户手动点击：立即查一次（跳过每日 TTL），并弹结果。"""
+        if self._updating:
+            return
+        self._kick_update_check(manual=True)
+
+    def _maybe_auto_check_update(self):
+        """随额度刷新的节拍顺带评估一次「今天查过了吗」。
+
+        只做时间戳比较，不发请求；真正到期（默认 24 小时）才去查一次
+        GitHub。这样不用再多一个定时器，也不会因为 App 常驻就反复请求。
+        """
+        if not self._state.get("update_check", True):
+            return                       # 用户关了更新提醒：一个请求都不发
+        if self._updating or self._update_checking:
+            return
+        if not quotacore.update_due(self._state.get("last_update_check"),
+                                    ttl_sec=_UPDATE_CHECK_TTL_SEC):
+            return
+        self._kick_update_check(manual=False)
+
+    def _kick_update_check(self, manual=False):
+        if not self._update_gate.try_begin(force=manual):
             return
         self._update_checking = True
-        self._check_update_item.title = _tr(self._lang(), "检查更新…", "Checking for updates…")
-        threading.Thread(target=self._async_check_update, daemon=True).start()
+        if manual:
+            self._check_update_item.title = _tr(
+                self._lang(), "检查更新…", "Checking for updates…")
+        threading.Thread(target=self._async_check_update, args=(manual,),
+                         daemon=True).start()
 
-    def _async_check_update(self):
-        """后台线程：查 GitHub 最新 Release。不能调任何 rumps/AppKit UI。"""
-        result = _fetch_latest_release_info()
-        with self._update_lock:
-            self._update_pending = result
+    def _async_check_update(self, manual=False):
+        """后台线程：查 fork 仓库最新 Release。不能调任何 rumps/AppKit UI。"""
+        try:
+            if not manual:
+                # 自动检查加抖动：避免所有装了这个 App 的机器在同一时刻
+                # 齐刷刷打 GitHub API
+                time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+            result = _fetch_latest_release_info()
+            result["manual"] = manual
+            with self._update_lock:
+                self._update_pending = result
+        finally:
+            self._update_gate.end()
 
     def _show_update_result(self, result):
+        """把一次检查结果落到状态、菜单和（必要时）通知/弹窗上。
+
+        manual=True（用户点了菜单）才弹窗；自动检查一律静默——后台每天一次的
+        检查如果每次都弹模态框，那是打扰不是提醒。自动路径只做三件事：
+        记时间戳、更新菜单标题、**对每个新版本弹一次**系统通知。
+        """
         lang = self._lang()
+        manual = bool(result.get("manual"))
+
         if result.get("error"):
-            _show_alert(
-                _tr(lang, "检查更新失败", "Update Check Failed"),
-                _tr(lang,
-                    "无法连接 GitHub，请检查网络后重试。",
-                    "Could not reach GitHub. Check your network and try again.",
-                ),
-                ok=_tr(lang, "好", "OK"),
-            )
-            return
-        latest = result["latest"]
-        if _version_tuple(latest) <= _version_tuple(__version__):
-            _show_alert(
-                _tr(lang, "已是最新版本", "You're Up to Date"),
-                _tr(lang,
-                    f"当前版本 {__version__} 已是最新。",
-                    f"Current version {__version__} is the latest.",
-                ),
-                ok=_tr(lang, "好", "OK"),
-            )
+            # 失败也记时间戳：否则连不上 GitHub 时会每 3 分钟重试一次，
+            # 正是这轮审计要消除的"失败后硬撞"。等下一个 TTL 再说。
+            self._state["last_update_check"] = time.time()
+            _save_state(self._state)
+            if manual:
+                _show_alert(
+                    _tr(lang, "检查更新失败", "Update Check Failed"),
+                    _tr(lang,
+                        "无法连接 GitHub，请检查网络后重试。",
+                        "Could not reach GitHub. Check your network and try again."),
+                    ok=_tr(lang, "好", "OK"),
+                )
             return
 
-        if not result.get("asset_url"):
-            # 防御性兜底：没在 Release 里找到 DMG 资产（比如某次发版漏传），
-            # 回退到旧的"打开下载页"手动流程。
-            opened = _show_alert(
-                _tr(lang, "发现新版本", "Update Available"),
-                _tr(lang,
-                    f"最新版本 {latest}，当前版本 {__version__}。是否打开下载页？",
-                    f"Latest version {latest}, current version {__version__}. Open the download page?",
-                ),
-                ok=_tr(lang, "打开下载页", "Open Download Page"),
-                cancel=_tr(lang, "取消", "Cancel"),
-            )
-            if opened:
-                page_url = _GITEE_RELEASES_PAGE_URL if result.get("source") == "gitee" else _RELEASES_PAGE_URL
-                webbrowser.open(page_url)
+        latest = result.get("latest") or ""
+        self._state["last_update_check"] = time.time()
+        self._state["update_seen"] = latest
+        _save_state(self._state)
+        self._update_check_item_title()
+
+        if not quotacore.is_newer_version(latest, __version__):
+            if manual:
+                _show_alert(
+                    _tr(lang, "已是最新版本", "You're Up to Date"),
+                    _tr(lang,
+                        f"当前版本 {__version__} 已是最新。",
+                        f"Current version {__version__} is the latest."),
+                    ok=_tr(lang, "好", "OK"),
+                )
             return
 
-        # 唯一一次确认：点了"立即更新"之后不再有二次确认，直接下载校验完就
-        # 退出重启（对齐 Claude App / Codex App / Trae 国际版的一键更新体验）。
-        # 仅测试用：Stage 3 端到端联调需要在真实冻结环境里跑通全流程但没有
-        # 人工点击 NSAlert 的手段，用一个显式的 autotest 环境变量跳过这一次
-        # 确认——只影响这一个弹窗，不影响其它任何提示；生产环境不会设置这个
-        # 变量，行为和现在完全一致。
-        if os.environ.get("AI_LIMIT_AUTOTEST_SKIP_CONFIRM") == "1":
-            update_now = True
-        else:
-            update_now = _show_alert(
-                _tr(lang, "发现新版本", "Update Available"),
-                _tr(lang,
-                    f"最新版本 {latest}，当前版本 {__version__}。是否立即更新？",
-                    f"Latest version {latest}, current version {__version__}. Update now?",
-                ),
-                ok=_tr(lang, "立即更新", "Update Now"),
-                cancel=_tr(lang, "取消", "Cancel"),
+        # ── 有新版 ──
+        if not manual:
+            # 每个版本只通知一次：装着不升级的用户不该每天被弹一次
+            if self._state.get("update_notified") != latest:
+                self._state["update_notified"] = latest
+                _save_state(self._state)
+                self._notify_update(latest)
+            return
+
+        opened = _show_alert(
+            _tr(lang, "发现新版本", "Update Available"),
+            _tr(lang,
+                f"最新版本 {latest}，当前版本 {__version__}。\n"
+                f"打开下载页获取安装包？",
+                f"Latest version {latest}, current version {__version__}.\n"
+                f"Open the download page to get the installer?"),
+            ok=_tr(lang, "打开下载页", "Open Download Page"),
+            cancel=_tr(lang, "稍后", "Later"),
+        )
+        if opened:
+            # 只用硬编码的 fork Releases 页，绝不用 feed 带回来的 URL
+            webbrowser.open(_RELEASES_PAGE_URL)
+
+    def _notify_update(self, latest):
+        """系统通知。失败不致命——菜单标题那条提醒已经在了，通知只是加一层。
+
+        （通知需要 App 有 bundle identifier；源码直跑时可能弹不出来，打包后正常。）
+        """
+        lang = self._lang()
+        try:
+            rumps.notification(
+                title=_tr(lang, "ai-limit 有新版本", "ai-limit update available"),
+                subtitle=_tr(lang, f"{__version__} → {latest}",
+                             f"{__version__} → {latest}"),
+                message=_tr(lang, "点菜单栏图标 →「发现新版本」下载",
+                            "Open the menu bar icon → \u201cUpdate available\u201d to download"),
             )
-        if update_now:
-            self._start_update(result)
+        except Exception:
+            pass
 
     def _start_update(self, result):
         if self._updating:

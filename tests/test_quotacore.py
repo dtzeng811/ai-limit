@@ -235,5 +235,42 @@ check("成功后恢复正常缓存", tc.get(_ok) == "operational")
 clk["t"] += 1
 check("恢复后 TTL 生效", tc.get(_ok) == "operational" and calls["n"] == 3)
 
+
+# ── 更新检查：版本比较 + 节流 + 通知去重 ────────────────────────────────────
+print("\n【version_tuple — 必须认得 fork 版本号】")
+check("普通语义化版本", qc.version_tuple("0.3.24") == (0, 3, 24))
+check("带 v 前缀", qc.version_tuple("v0.3.24") == (0, 3, 24))
+check("fork 版本（tag 用连字符）", qc.version_tuple("0.3.23-fork.14") == (0, 3, 23, 14))
+check("fork 版本（__version__ 用加号）", qc.version_tuple("0.3.23+fork.14") == (0, 3, 23, 14))
+check("两种写法等值（这是能正确比较的前提）",
+      qc.version_tuple("0.3.23+fork.14") == qc.version_tuple("v0.3.23-fork.14"))
+check("预发布后缀不崩", qc.version_tuple("0.3.13-rc1") == (0, 3, 13))
+check("空串不崩", qc.version_tuple("") == (0,))
+check("垃圾串不崩", qc.version_tuple("nightly") == (0,))
+
+print("\n【is_newer_version】")
+check("fork.15 > fork.14", qc.is_newer_version("0.3.23-fork.15", "0.3.23+fork.14"))
+check("fork.14 不新于自己", not qc.is_newer_version("0.3.23-fork.14", "0.3.23+fork.14"))
+check("fork.9 不新于 fork.14（数字比较非字典序）",
+      not qc.is_newer_version("0.3.23-fork.9", "0.3.23+fork.14"))
+check("fork.14 新于 fork.9", qc.is_newer_version("0.3.23-fork.14", "0.3.23+fork.9"))
+check("大版本更新", qc.is_newer_version("0.4.0", "0.3.23+fork.14"))
+check("降级不算新版（防误装旧包）",
+      not qc.is_newer_version("0.3.22", "0.3.23+fork.14"))
+check("latest 为空不算新版", not qc.is_newer_version("", "0.3.23+fork.14"))
+check("latest 为 None 不算新版", not qc.is_newer_version(None, "0.3.23+fork.14"))
+
+print("\n【update_due — 每天最多查一次，重启不重查】")
+DAY = 24 * 3600
+check("从未查过 → 该查", qc.update_due(0.0, now=1000.0))
+check("刚查过 → 不该查", not qc.update_due(1000.0, now=1000.0 + 60))
+check("差一点到期 → 不该查", not qc.update_due(1000.0, now=1000.0 + DAY - 10))
+check("到期 → 该查", qc.update_due(1000.0, now=1000.0 + DAY + 1))
+check("时钟回拨（last 在未来）→ 该查，不会永久卡住",
+      qc.update_due(9999999.0, now=1000.0))
+check("last 非数字 → 该查（状态文件被改坏也不能瘫）",
+      qc.update_due("坏数据", now=1000.0))
+check("自定义 TTL 生效", qc.update_due(1000.0, now=1000.0 + 700, ttl_sec=600))
+
 print("\n" + ("FAILED: " + ", ".join(FAILS) if FAILS else "ALL PASS"))
 sys.exit(1 if FAILS else 0)

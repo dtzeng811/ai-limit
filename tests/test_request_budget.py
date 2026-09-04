@@ -472,6 +472,67 @@ check("检查失败不通知", u4.notified, [])
 
 app._save_state = _orig_save2
 
+# ── 手动刷新不能被丢弃、也不该陪着抖动睡 ────────────────────────────────────
+print("\n【手动刷新的响应性】")
+import threading as _th5
+import time as _t5
+
+
+class _StubRefresh:
+    """只带刷新链路需要的字段。用可控的 fetch 时长模拟真实抓取。"""
+    def __init__(self, fetch_sec=0.2):
+        self._fetch_gate = quotacore.SingleFlight(app._MANUAL_REFRESH_COOLDOWN_SEC)
+        self._fetch_wake = _th5.Event()
+        self.rounds = []          # 每轮 (是否带抖动, 开始时刻)
+        self._fetch_sec = fetch_sec
+
+    _kick_background_fetch = app.AiLimitApp._kick_background_fetch
+    _async_refresh = app.AiLimitApp._async_refresh
+
+    def _async_refresh_inner(self, jitter=False):
+        if jitter:
+            self._fetch_wake.clear()
+            self._fetch_wake.wait(5.0)      # 用 5 秒代表"抖动等待"
+            self._fetch_wake.clear()
+        self.rounds.append(jitter)
+        _t5.sleep(self._fetch_sec)
+
+
+# 自动轮正卡在抖动等待里，用户点刷新 → 必须立刻被叫醒，而不是等满 5 秒
+r = _StubRefresh()
+t0 = _t5.time()
+r._kick_background_fetch(jitter=True)        # 自动轮，进入抖动等待
+_t5.sleep(0.15)
+r._kick_background_fetch(force=True)         # 用户点击
+for _ in range(60):
+    if len(r.rounds) >= 1:
+        break
+    _t5.sleep(0.05)
+woke_after = _t5.time() - t0
+print(f"      点击后 {woke_after:.2f}s 内开始抓取（不修的话要等满 5s）")
+check("手动点击打断抖动等待（<1.5s 内开抓）", woke_after < 1.5, True)
+
+# 等补跑完成
+for _ in range(80):
+    if len(r.rounds) >= 2:
+        break
+    _t5.sleep(0.05)
+check("点击不会被丢弃：本轮结束后补跑一轮", len(r.rounds) >= 2, True)
+check("补跑的那一轮不带抖动（用户在等）", r.rounds[-1], False)
+
+# 连点多次只补跑一轮，不会变成请求突发
+r2 = _StubRefresh(fetch_sec=0.4)
+r2._kick_background_fetch()                  # 占住闸门（无抖动，直接抓 0.4s）
+_t5.sleep(0.05)
+for _ in range(6):
+    r2._kick_background_fetch(force=True)    # 连点 6 下
+for _ in range(60):
+    if len(r2.rounds) >= 2:
+        break
+    _t5.sleep(0.05)
+_t5.sleep(0.6)
+check("连点 6 下最多只多跑 1 轮（合并，不是 6 轮）", len(r2.rounds), 2)
+
 # ── 全天请求量对照（假时钟推进真实时间，否则 TTL 永不过期，数字是假的）──────
 print("\n【默认配置每天请求量（假时钟推进 24 小时）】")
 ROUNDS_PER_DAY = 24 * 20                  # 3 分钟一轮

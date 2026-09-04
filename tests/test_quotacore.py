@@ -190,6 +190,28 @@ check("force=True 无视冷却（用户显式操作）", sf.try_begin(force=True
 sf.end()
 check("force 仍受并发保护", (sf.try_begin(force=True), sf.try_begin(force=True))[1] is False)
 sf.end()
+# 用户在别人执行期间点了刷新：**不能丢弃**，要记下来在本轮结束后补跑一轮。
+# 丢弃 = 用户点了没反应（自动刷新占用闸门期间点击会石沉大海）。
+sf3 = qc.SingleFlight(cooldown_sec=5.0, clock=lambda: clock["t"])
+check("先占住闸门", sf3.try_begin() is True)
+check("占用期间的 force 点击仍被拒（不并发）", sf3.try_begin(force=True) is False)
+check("但会被记为待补跑，end() 返回 True", sf3.end() is True)
+check("补跑标记是一次性的，第二次 end 不再重复", (sf3.try_begin(), sf3.end())[1] is False)
+
+# 非 force（自动刷新撞上自动刷新）不该触发补跑——那只是多余请求
+sf4 = qc.SingleFlight(clock=lambda: clock["t"])
+sf4.try_begin()
+sf4.try_begin(force=False)
+check("自动触发被挡下不产生补跑", sf4.end() is False)
+
+# 连点多次只补跑一轮（合并，不是排队 N 次）
+sf5 = qc.SingleFlight(clock=lambda: clock["t"])
+sf5.try_begin()
+for _ in range(5):
+    sf5.try_begin(force=True)
+check("连点 5 次只合并成一次补跑", sf5.end() is True)
+check("合并后不残留第二次", (sf5.try_begin(), sf5.end())[1] is False)
+
 # 异常路径必须释放，否则永久卡死
 sf2 = qc.SingleFlight(clock=lambda: clock["t"])
 try:

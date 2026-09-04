@@ -190,12 +190,20 @@ class SingleFlight:
         self._clock = clock
         self._busy = False
         self._last_begin = float("-inf")
+        self._followup = False
         self._lock = _threading.Lock()
 
     def try_begin(self, *, force=False) -> bool:
-        """拿到执行权返回 True；被并发或冷却挡下返回 False（调用方直接跳过）。"""
+        """拿到执行权返回 True；被并发或冷却挡下返回 False（调用方直接跳过）。
+
+        **被挡下的 force 请求会被记住**：force 意味着用户在等结果，直接丢弃
+        等于"点了没反应"。end() 会告诉调用方需要补跑一轮。多次点击合并成
+        一次补跑——用户连点 5 下不该换来 5 轮请求。
+        """
         with self._lock:
             if self._busy:
+                if force:
+                    self._followup = True
                 return False
             if not force and (self._clock() - self._last_begin) < self.cooldown_sec:
                 return False
@@ -203,9 +211,13 @@ class SingleFlight:
             self._last_begin = self._clock()
             return True
 
-    def end(self):
+    def end(self) -> bool:
+        """释放执行权。返回 True 表示本轮进行中有用户点击被合并掉了，
+        调用方应当立刻再跑一轮（否则那次点击就白点了）。"""
         with self._lock:
             self._busy = False
+            again, self._followup = self._followup, False
+            return again
 
     @_contextlib.contextmanager
     def guard(self, *, force=False):

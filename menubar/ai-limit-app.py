@@ -1379,6 +1379,9 @@ class AiLimitApp(rumps.App):
         # 请求也让流量形态像自动化脚本。冷却只挡自动触发，用户显式操作走
         # force=True（但并发保护始终生效，正在抓就不会再开一组）。
         self._fetch_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
+        # 用户点「立即刷新」时用来打断自动轮的抖动等待：抖动是为了不在整点
+        # 齐刷刷发请求，但用户已经在等结果了，没有理由再让他陪着睡 0~20 秒
+        self._fetch_wake = threading.Event()
         self._ip_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._forecast_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
         self._update_gate = quotacore.SingleFlight(_MANUAL_REFRESH_COOLDOWN_SEC)
@@ -2157,6 +2160,11 @@ class AiLimitApp(rumps.App):
         延后重放，仍然是多余请求）。force=True 供用户显式刷新跳过冷却。
         """
         if not self._fetch_gate.try_begin(force=force):
+            if force:
+                # 没抢到闸门，但点击已被 SingleFlight 记下（本轮结束会补跑）。
+                # 如果那一轮正卡在抖动 sleep 上，顺手把它叫醒——用户等的是
+                # 数据，不是那 0~20 秒的抖动。
+                self._fetch_wake.set()
             return
         t = threading.Thread(target=self._async_refresh, args=(jitter,), daemon=True)
         t.start()
@@ -2166,12 +2174,20 @@ class AiLimitApp(rumps.App):
         try:
             self._async_refresh_inner(jitter)
         finally:
-            self._fetch_gate.end()      # 异常路径也必须放闸，否则永久不再刷新
+            # end() 返回 True = 这一轮进行中用户点过刷新。补跑一轮，否则那次
+            # 点击就白点了（旧实现直接丢弃，表现就是"点了没反应"）。
+            again = self._fetch_gate.end()
+        if again:
+            self._kick_background_fetch(force=True)
 
     def _async_refresh_inner(self, jitter=False):
         if jitter:
-            # 打破精确节拍：sleep 在后台线程里，不阻塞 UI。
-            time.sleep(random.uniform(0, _JITTER_MAX_SEC))
+            # 打破精确节拍：等待在后台线程里，不阻塞 UI。用 Event.wait 而不是
+            # sleep，这样用户点「立即刷新」可以立刻把它叫醒——否则手动刷新最长
+            # 要等这一轮抖动睡完（实测最坏 23 秒毫无反馈）。
+            self._fetch_wake.clear()
+            self._fetch_wake.wait(random.uniform(0, _JITTER_MAX_SEC))
+            self._fetch_wake.clear()
         lang = self._lang()
         now = time.time()
         need = set(self._state.get("bar_services") or []) | set(self._state.get("panel_services") or [])
